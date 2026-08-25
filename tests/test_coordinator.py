@@ -1,7 +1,12 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+# Make the src-layout package importable when tests are run directly from a
+# source checkout with ``python -m unittest discover`` (without installation).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from semantic_saga_mcp.actions import DryRunHttpAction, FileTransactionTool, HttpAction, HttpRequest
 from semantic_saga_mcp.coordinator import Coordinator, SagaError

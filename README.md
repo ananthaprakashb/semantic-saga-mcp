@@ -17,12 +17,14 @@ This is a coordination framework, not an ACID transaction spanning independent s
 
 ## Quick start
 
-Python 3.11 or newer is required.
+Python 3.10 or newer is required.
 
 ```bash
 python -m pip install -e .
 semantic-saga-mcp
 ```
+
+Installing the package is recommended because it also installs runtime dependencies. Tests can nevertheless import the `src` layout directly from a checkout, so `python -m unittest discover -s tests -v` no longer requires an editable install.
 
 Example MCP client configuration:
 

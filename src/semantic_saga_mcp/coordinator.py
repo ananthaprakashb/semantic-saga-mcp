@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from .actions import Action
@@ -9,7 +9,7 @@ from .store import SagaStoreProtocol
 
 
 def now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 class SagaError(RuntimeError):
