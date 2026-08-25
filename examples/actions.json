@@ -1,0 +1,14 @@
+{
+  "reserve_inventory": {
+    "forward": {
+      "url": "http://inventory.internal/reservations",
+      "method": "POST",
+      "body": {"sku": "${input.sku}", "quantity": "${input.quantity}"}
+    },
+    "rollback": {
+      "url": "http://inventory.internal/reservations/cancel",
+      "method": "POST",
+      "body": {"reservation_id": "${result.reservation_id}"}
+    }
+  }
+}
