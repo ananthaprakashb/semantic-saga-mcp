@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
+from . import __version__
 from .actions import Action, FileTransactionTool, load_actions
 from .coordinator import Coordinator, SagaError
 from .store import SagaStore, SQLiteSagaStore
@@ -93,7 +94,7 @@ class McpServer:
             if request.id is None:
                 return None
             if request.method == "initialize":
-                result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": False}, "prompts": {"listChanged": False}}, "serverInfo": {"name": "semantic-saga-mcp", "version": "0.1.0"}}
+                result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": False}, "prompts": {"listChanged": False}}, "serverInfo": {"name": "semantic-saga-mcp", "version": __version__}}
             elif request.method == "ping":
                 result = {}
             elif request.method == "tools/list":
@@ -189,6 +190,7 @@ class McpServer:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Durable MCP saga coordinator")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--actions", default=os.getenv("SAGA_ACTIONS_FILE"), help="JSON action definitions")
     parser.add_argument("--file-root", default=os.getenv("SAGA_FILE_ROOT", "./saga-files"), help="Root directory for the built-in create_text_file action")
     parser.add_argument("--database", default=os.getenv("SAGA_DATABASE"), help="SQLite path (default: in-memory store)")

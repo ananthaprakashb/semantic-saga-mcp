@@ -143,3 +143,23 @@ python -m unittest discover -s tests -v
 ```
 
 The MCP transport writes only JSON-RPC messages to stdout. Keep application diagnostics on stderr so clients can parse the protocol stream.
+
+## Publishing to PyPI
+
+Package metadata, the MIT license, typed-package marker, console entry point, and a trusted-publishing GitHub Actions workflow are included. Before publishing a release:
+
+1. Update `__version__` in `src/semantic_saga_mcp/__init__.py` and commit it.
+2. Run the tests and build validation locally:
+
+   ```bash
+   python -m pip install --upgrade build twine
+   python -m unittest discover -s tests -v
+   python -m build
+   python -m twine check dist/*
+   ```
+
+3. Confirm both the wheel and source distribution contain `LICENSE`, `README.md`, and `semantic_saga_mcp/py.typed`.
+4. Configure a PyPI Trusted Publisher for this repository with workflow `publish.yml` and environment `pypi`.
+5. Publish a GitHub release. The workflow builds once, validates the distributions, and publishes that exact artifact to PyPI using OpenID Connect rather than a long-lived API token.
+
+PyPI does not allow a released filename/version to be replaced. Increment `__version__` for every release, including corrections to a failed or incomplete publication.
