@@ -9,13 +9,15 @@ A standalone [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) se
 - **Reverse-order compensation:** completed mutations unwind from newest to oldest.
 - **Idempotency:** forward and compensation requests receive stable `Idempotency-Key` headers. Endpoints **must honor these keys** because networks cannot provide exactly-once delivery.
 - **Durability and inspection:** sagas, results, errors, and retry counts live in SQLite and are available through `get_saga`.
+- **Session isolation:** every saga is owned by its transport session. Lookups, commits, steps, and rollbacks from another connected agent behave as if that saga does not exist.
+- **Schema enforcement:** Pydantic strict models reject missing, mistyped, or unexpected JSON-RPC tool arguments before coordinator code can run.
 - **Safe action surface:** agents select administrator-configured actions; they cannot supply arbitrary URLs or credentials.
 
 This is a coordination framework, not an ACID transaction spanning independent systems. A compensation can itself fail. That state is reported as `ROLLBACK_FAILED` for operator or client retry rather than being hidden.
 
 ## Quick start
 
-Python 3.11 or newer is required. The server has no runtime dependencies.
+Python 3.11 or newer is required.
 
 ```bash
 python -m pip install -e .
@@ -36,6 +38,17 @@ Example MCP client configuration:
 ```
 
 Environment variables `SAGA_ACTIONS_FILE` and `SAGA_DATABASE` are alternatives to CLI flags.
+
+### Remote SSE transport
+
+The default `stdio` transport is intended for local IDE and desktop integrations. For remote agents, run the MCP SSE transport instead:
+
+```bash
+semantic-saga-mcp --transport sse --host 0.0.0.0 --port 8000 \
+  --actions ./examples/actions.json --database ./semantic-saga.db
+```
+
+Set `SAGA_TRANSPORT`, `SAGA_HOST`, and `SAGA_PORT` instead of the corresponding flags if desired. SSE clients connect to `GET /sse`; the server emits that connection's unique `POST /messages?session_id=...` endpoint. Deploy behind TLS and authentication at a trusted reverse proxy when exposing the service outside a private network.
 
 ## Configure actions
 

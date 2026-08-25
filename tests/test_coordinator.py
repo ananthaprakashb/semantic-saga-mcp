@@ -66,6 +66,23 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(response["id"], 1)
         self.assertEqual(response["result"]["structuredContent"]["status"], "ACTIVE")
 
+    def test_sessions_cannot_read_or_rollback_each_others_sagas(self):
+        server = McpServer(self.coordinator)
+        begin = server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "begin_saga", "arguments": {}}}, "agent-a")
+        saga_id = begin["result"]["structuredContent"]["id"]
+        response = server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "rollback_saga", "arguments": {"saga_id": saga_id}}}, "agent-b")
+        self.assertEqual(response["error"]["code"], -32602)
+        self.assertEqual(self.coordinator.get(saga_id, session_id="agent-a")["status"], "ACTIVE")
+
+    def test_tool_arguments_are_strictly_validated_before_execution(self):
+        server = McpServer(self.coordinator)
+        response = server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "begin_saga", "arguments": {"metadata": "not-an-object"}}})
+        self.assertEqual(response["error"]["code"], -32602)
+        self.assertEqual(self.coordinator.store.one("SELECT COUNT(*) AS n FROM sagas")["n"], 0)
+
+        response = server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "get_saga", "arguments": {"saga_id": "x", "unexpected": True}}})
+        self.assertEqual(response["error"]["code"], -32602)
+
 
 if __name__ == "__main__":
     unittest.main()
