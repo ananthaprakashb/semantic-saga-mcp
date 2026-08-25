@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "semantic-saga": {
+      "command": "/ABSOLUTE/PATH/TO/semantic-saga-mcp/.venv/bin/semantic-saga-mcp",
+      "args": [
+        "--file-root",
+        "/ABSOLUTE/PATH/TO/semantic-saga-mcp/saga-files",
+        "--database",
+        "/ABSOLUTE/PATH/TO/semantic-saga-mcp/semantic-saga.db"
+      ]
+    }
+  }
+}
