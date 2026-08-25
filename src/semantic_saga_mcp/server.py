@@ -6,13 +6,15 @@ import json
 import os
 import sys
 import uuid
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
-from .actions import load_actions
+from . import __version__
+from .actions import Action, FileTransactionTool, load_actions
 from .coordinator import Coordinator, SagaError
-from .store import SagaStore
+from .store import SagaStore, SQLiteSagaStore
 
 
 class StrictModel(BaseModel):
@@ -33,7 +35,12 @@ class ExecuteArguments(SagaArguments):
 
 
 class ToolCallParams(StrictModel):
-    name: Literal["begin_saga", "execute_saga_step", "commit_saga", "rollback_saga", "get_saga"]
+    name: Literal["begin_saga", "execute_saga_step", "commit_saga", "rollback_saga", "trigger_rollback", "get_saga"]
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromptGetParams(StrictModel):
+    name: Literal["saga-coordinator"]
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -49,6 +56,7 @@ ARGUMENT_MODELS = {
     "execute_saga_step": ExecuteArguments,
     "commit_saga": SagaArguments,
     "rollback_saga": SagaArguments,
+    "trigger_rollback": SagaArguments,
     "get_saga": SagaArguments,
 }
 
@@ -57,7 +65,21 @@ TOOLS = [
     {"name": "execute_saga_step", "description": "Execute a configured action and durably register its compensation.", "inputSchema": ExecuteArguments.model_json_schema()},
     {"name": "commit_saga", "description": "Commit a successfully completed saga; it can no longer be rolled back.", "inputSchema": SagaArguments.model_json_schema()},
     {"name": "rollback_saga", "description": "Compensate saga steps in reverse order.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "trigger_rollback", "description": "Immediately compensate saga steps in reverse order after an error.", "inputSchema": SagaArguments.model_json_schema()},
     {"name": "get_saga", "description": "Inspect saga and step status, results, and rollback failures.", "inputSchema": SagaArguments.model_json_schema()},
+]
+
+SYSTEM_PROMPT = (
+    "When executing multi-step infrastructure changes, wrap your actions in the Saga Coordinator. "
+    "If you encounter an error, immediately call the `trigger_rollback` tool."
+)
+PROMPTS = [
+    {
+        "name": "saga-coordinator",
+        "title": "Saga Coordinator",
+        "description": SYSTEM_PROMPT,
+        "arguments": [],
+    }
 ]
 
 
@@ -72,13 +94,21 @@ class McpServer:
             if request.id is None:
                 return None
             if request.method == "initialize":
-                result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "semantic-saga-mcp", "version": "0.1.0"}}
+                result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": False}, "prompts": {"listChanged": False}}, "serverInfo": {"name": "semantic-saga-mcp", "version": __version__}}
             elif request.method == "ping":
                 result = {}
             elif request.method == "tools/list":
                 result = {"tools": TOOLS}
             elif request.method == "tools/call":
                 result = self._call(request.params, session_id)
+            elif request.method == "prompts/list":
+                result = {"prompts": PROMPTS}
+            elif request.method == "prompts/get":
+                params = PromptGetParams.model_validate(request.params)
+                result = {
+                    "description": PROMPTS[0]["description"],
+                    "messages": [{"role": "user", "content": {"type": "text", "text": SYSTEM_PROMPT}}],
+                }
             else:
                 return self._error(request.id, -32601, f"Method not found: {request.method}")
             return {"jsonrpc": "2.0", "id": request.id, "result": result}
@@ -98,7 +128,7 @@ class McpServer:
             value = self.coordinator.execute(args.saga_id, args.action, args.input, session_id=session_id)
         elif params.name == "commit_saga":
             value = self.coordinator.commit(args.saga_id, session_id=session_id)
-        elif params.name == "rollback_saga":
+        elif params.name in {"rollback_saga", "trigger_rollback"}:
             value = self.coordinator.rollback(args.saga_id, session_id=session_id)
         else:
             value = self.coordinator.get(args.saga_id, session_id=session_id)
@@ -160,15 +190,22 @@ class McpServer:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Durable MCP saga coordinator")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--actions", default=os.getenv("SAGA_ACTIONS_FILE"), help="JSON action definitions")
-    parser.add_argument("--database", default=os.getenv("SAGA_DATABASE", "./semantic-saga.db"))
+    parser.add_argument("--file-root", default=os.getenv("SAGA_FILE_ROOT", "./saga-files"), help="Root directory for the built-in create_text_file action")
+    parser.add_argument("--database", default=os.getenv("SAGA_DATABASE"), help="SQLite path (default: in-memory store)")
     parser.add_argument("--transport", choices=("stdio", "sse"), default=os.getenv("SAGA_TRANSPORT", "stdio"))
     parser.add_argument("--host", default=os.getenv("SAGA_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("SAGA_PORT", "8000")))
+    parser.add_argument("--dry-run", action="store_true", default=os.getenv("SAGA_DRY_RUN", "").lower() in {"1", "true", "yes"}, help="Preview actions, simulate failure, and log compensation without API calls")
     args = parser.parse_args()
-    if not args.actions:
-        parser.error("--actions or SAGA_ACTIONS_FILE is required")
-    server = McpServer(Coordinator(SagaStore(args.database), load_actions(args.actions)))
+    store = SQLiteSagaStore(args.database) if args.database else SagaStore()
+    logger = lambda message: print(message, file=sys.stderr, flush=True)
+    actions: dict[str, Action] = load_actions(args.actions, dry_run=args.dry_run, log=logger) if args.actions else {}
+    actions["create_text_file"] = FileTransactionTool(Path(args.file_root), logger)
+    coordinator = Coordinator(store, actions)
+    coordinator.resume_pending_rollbacks()
+    server = McpServer(coordinator)
     if args.transport == "stdio":
         server.run_stdio()
     else:
