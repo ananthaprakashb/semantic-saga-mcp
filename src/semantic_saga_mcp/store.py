@@ -19,7 +19,7 @@ class SagaStore:
         self._db.executescript("""
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS sagas (
-              id TEXT PRIMARY KEY, status TEXT NOT NULL, metadata TEXT NOT NULL,
+              id TEXT PRIMARY KEY, session_id TEXT NOT NULL, status TEXT NOT NULL, metadata TEXT NOT NULL,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT
             );
             CREATE TABLE IF NOT EXISTS steps (
@@ -30,6 +30,16 @@ class SagaStore:
               UNIQUE(saga_id, sequence), FOREIGN KEY(saga_id) REFERENCES sagas(id)
             );
         """)
+        # Upgrade databases created by releases before session isolation. Legacy
+        # rows remain accessible only to the legacy/default session.
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(sagas)")}
+        if "session_id" not in columns:
+            self._db.execute(
+                "ALTER TABLE sagas ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default'"
+            )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sagas_session ON sagas(session_id, id)"
+        )
         self._db.commit()
 
     def execute(self, sql: str, values: tuple[Any, ...] = ()) -> None:

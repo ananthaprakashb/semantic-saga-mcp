@@ -1,22 +1,63 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
-from typing import Any
+import uuid
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 from .actions import load_actions
 from .coordinator import Coordinator, SagaError
 from .store import SagaStore
 
 
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class BeginArguments(StrictModel):
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SagaArguments(StrictModel):
+    saga_id: StrictStr = Field(min_length=1)
+
+
+class ExecuteArguments(SagaArguments):
+    action: StrictStr = Field(min_length=1)
+    input: dict[str, Any]
+
+
+class ToolCallParams(StrictModel):
+    name: Literal["begin_saga", "execute_saga_step", "commit_saga", "rollback_saga", "get_saga"]
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class JsonRpcRequest(StrictModel):
+    jsonrpc: Literal["2.0"]
+    id: int | StrictStr | None = None
+    method: StrictStr
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+ARGUMENT_MODELS = {
+    "begin_saga": BeginArguments,
+    "execute_saga_step": ExecuteArguments,
+    "commit_saga": SagaArguments,
+    "rollback_saga": SagaArguments,
+    "get_saga": SagaArguments,
+}
+
 TOOLS = [
-    {"name": "begin_saga", "description": "Start a durable transactional workflow.", "inputSchema": {"type": "object", "properties": {"metadata": {"type": "object"}}}},
-    {"name": "execute_saga_step", "description": "Execute a configured action and durably register its compensation.", "inputSchema": {"type": "object", "properties": {"saga_id": {"type": "string"}, "action": {"type": "string"}, "input": {"type": "object"}}, "required": ["saga_id", "action", "input"]}},
-    {"name": "commit_saga", "description": "Commit a successfully completed saga; it can no longer be rolled back.", "inputSchema": {"type": "object", "properties": {"saga_id": {"type": "string"}}, "required": ["saga_id"]}},
-    {"name": "rollback_saga", "description": "Compensate saga steps in reverse order. Safe compensation endpoints receive stable idempotency keys.", "inputSchema": {"type": "object", "properties": {"saga_id": {"type": "string"}}, "required": ["saga_id"]}},
-    {"name": "get_saga", "description": "Inspect saga and step status, results, and rollback failures.", "inputSchema": {"type": "object", "properties": {"saga_id": {"type": "string"}}, "required": ["saga_id"]}},
+    {"name": "begin_saga", "description": "Start a durable transactional workflow.", "inputSchema": BeginArguments.model_json_schema()},
+    {"name": "execute_saga_step", "description": "Execute a configured action and durably register its compensation.", "inputSchema": ExecuteArguments.model_json_schema()},
+    {"name": "commit_saga", "description": "Commit a successfully completed saga; it can no longer be rolled back.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "rollback_saga", "description": "Compensate saga steps in reverse order.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "get_saga", "description": "Inspect saga and step status, results, and rollback failures.", "inputSchema": SagaArguments.model_json_schema()},
 ]
 
 
@@ -24,60 +65,115 @@ class McpServer:
     def __init__(self, coordinator: Coordinator) -> None:
         self.coordinator = coordinator
 
-    def dispatch(self, message: dict[str, Any]) -> dict[str, Any] | None:
-        request_id, method = message.get("id"), message.get("method")
-        if request_id is None:  # notification
-            return None
+    def dispatch(self, message: dict[str, Any], session_id: str = "default") -> dict[str, Any] | None:
+        request_id = message.get("id") if isinstance(message, dict) else None
         try:
-            if method == "initialize":
+            request = JsonRpcRequest.model_validate(message)
+            if request.id is None:
+                return None
+            if request.method == "initialize":
                 result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "semantic-saga-mcp", "version": "0.1.0"}}
-            elif method == "ping":
+            elif request.method == "ping":
                 result = {}
-            elif method == "tools/list":
+            elif request.method == "tools/list":
                 result = {"tools": TOOLS}
-            elif method == "tools/call":
-                result = self._call(message.get("params", {}))
+            elif request.method == "tools/call":
+                result = self._call(request.params, session_id)
             else:
-                return self._error(request_id, -32601, f"Method not found: {method}")
-            return {"jsonrpc": "2.0", "id": request_id, "result": result}
+                return self._error(request.id, -32601, f"Method not found: {request.method}")
+            return {"jsonrpc": "2.0", "id": request.id, "result": result}
+        except ValidationError as exc:
+            return self._error(request_id, -32602, f"Invalid request: {exc}")
         except (SagaError, KeyError, TypeError, ValueError) as exc:
             return self._error(request_id, -32602, str(exc))
         except Exception as exc:
             return self._error(request_id, -32603, f"Internal error: {exc}")
 
-    def _call(self, params: dict[str, Any]) -> dict[str, Any]:
-        name, args = params["name"], params.get("arguments", {})
-        if name == "begin_saga": value = self.coordinator.begin(args.get("metadata"))
-        elif name == "execute_saga_step": value = self.coordinator.execute(args["saga_id"], args["action"], args["input"])
-        elif name == "commit_saga": value = self.coordinator.commit(args["saga_id"])
-        elif name == "rollback_saga": value = self.coordinator.rollback(args["saga_id"])
-        elif name == "get_saga": value = self.coordinator.get(args["saga_id"])
-        else: raise ValueError(f"Unknown tool: {name}")
+    def _call(self, raw_params: dict[str, Any], session_id: str) -> dict[str, Any]:
+        params = ToolCallParams.model_validate(raw_params)
+        args = ARGUMENT_MODELS[params.name].model_validate(params.arguments)
+        if isinstance(args, BeginArguments):
+            value = self.coordinator.begin(args.metadata, session_id=session_id)
+        elif isinstance(args, ExecuteArguments):
+            value = self.coordinator.execute(args.saga_id, args.action, args.input, session_id=session_id)
+        elif params.name == "commit_saga":
+            value = self.coordinator.commit(args.saga_id, session_id=session_id)
+        elif params.name == "rollback_saga":
+            value = self.coordinator.rollback(args.saga_id, session_id=session_id)
+        else:
+            value = self.coordinator.get(args.saga_id, session_id=session_id)
         return {"content": [{"type": "text", "text": json.dumps(value, separators=(",", ":"))}], "structuredContent": value}
 
     @staticmethod
     def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
-    def run(self) -> None:
-        # MCP stdio uses one JSON-RPC message per line. Never write diagnostics to stdout.
+    def run_stdio(self) -> None:
+        session_id = f"stdio:{uuid.uuid4()}"
         for line in sys.stdin:
             try:
-                response = self.dispatch(json.loads(line))
+                response = self.dispatch(json.loads(line), session_id)
                 if response is not None:
                     print(json.dumps(response, separators=(",", ":")), flush=True)
             except json.JSONDecodeError as exc:
                 print(json.dumps(self._error(None, -32700, f"Parse error: {exc}")), flush=True)
+
+    def sse_app(self) -> Any:
+        from starlette.applications import Starlette
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, StreamingResponse
+        from starlette.routing import Route
+
+        queues: dict[str, asyncio.Queue[str]] = {}
+
+        async def sse(request: Request) -> StreamingResponse:
+            session_id = str(uuid.uuid4())
+            queue: asyncio.Queue[str] = asyncio.Queue()
+            queues[session_id] = queue
+
+            async def events():
+                try:
+                    yield f"event: endpoint\ndata: /messages?session_id={session_id}\n\n"
+                    while True:
+                        yield f"event: message\ndata: {await queue.get()}\n\n"
+                finally:
+                    queues.pop(session_id, None)
+
+            return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+        async def messages(request: Request) -> JSONResponse:
+            session_id = request.query_params.get("session_id", "")
+            queue = queues.get(session_id)
+            if queue is None:
+                return JSONResponse({"error": "Unknown or disconnected session"}, status_code=404)
+            try:
+                payload = await request.json()
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+            response = self.dispatch(payload, session_id)
+            if response is not None:
+                await queue.put(json.dumps(response, separators=(",", ":")))
+            return JSONResponse({}, status_code=202)
+
+        return Starlette(routes=[Route("/sse", sse, methods=["GET"]), Route("/messages", messages, methods=["POST"])])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Durable MCP saga coordinator")
     parser.add_argument("--actions", default=os.getenv("SAGA_ACTIONS_FILE"), help="JSON action definitions")
     parser.add_argument("--database", default=os.getenv("SAGA_DATABASE", "./semantic-saga.db"))
+    parser.add_argument("--transport", choices=("stdio", "sse"), default=os.getenv("SAGA_TRANSPORT", "stdio"))
+    parser.add_argument("--host", default=os.getenv("SAGA_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("SAGA_PORT", "8000")))
     args = parser.parse_args()
     if not args.actions:
         parser.error("--actions or SAGA_ACTIONS_FILE is required")
-    McpServer(Coordinator(SagaStore(args.database), load_actions(args.actions))).run()
+    server = McpServer(Coordinator(SagaStore(args.database), load_actions(args.actions)))
+    if args.transport == "stdio":
+        server.run_stdio()
+    else:
+        import uvicorn
+        uvicorn.run(server.sse_app(), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

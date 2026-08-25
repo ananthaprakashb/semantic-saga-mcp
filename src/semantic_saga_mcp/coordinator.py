@@ -21,14 +21,14 @@ class Coordinator:
     def __init__(self, store: SagaStore, actions: dict[str, Action], compensation_retries: int = 3) -> None:
         self.store, self.actions, self.compensation_retries = store, actions, compensation_retries
 
-    def begin(self, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    def begin(self, metadata: dict[str, Any] | None = None, *, session_id: str = "default") -> dict[str, Any]:
         saga_id, timestamp = str(uuid.uuid4()), now()
-        self.store.execute("INSERT INTO sagas VALUES (?, 'ACTIVE', ?, ?, ?, NULL)",
-                           (saga_id, json.dumps(metadata or {}), timestamp, timestamp))
-        return self.get(saga_id)
+        self.store.execute("INSERT INTO sagas (id, session_id, status, metadata, created_at, updated_at, error) VALUES (?, ?, 'ACTIVE', ?, ?, ?, NULL)",
+                           (saga_id, session_id, json.dumps(metadata or {}), timestamp, timestamp))
+        return self.get(saga_id, session_id=session_id)
 
-    def execute(self, saga_id: str, action_name: str, values: dict[str, Any]) -> dict[str, Any]:
-        saga = self._require(saga_id)
+    def execute(self, saga_id: str, action_name: str, values: dict[str, Any], *, session_id: str = "default") -> dict[str, Any]:
+        saga = self._require(saga_id, session_id)
         if saga["status"] != "ACTIVE":
             raise SagaError(f"Saga {saga_id} is {saga['status']}; steps require ACTIVE")
         if action_name not in self.actions:
@@ -47,18 +47,18 @@ class Coordinator:
         except Exception as exc:
             self.store.execute("UPDATE steps SET status='FAILED', error=?, updated_at=? WHERE id=?", (str(exc), now(), step_id))
             self.store.execute("UPDATE sagas SET status='FAILED', error=?, updated_at=? WHERE id=?", (str(exc), now(), saga_id))
-            self.rollback(saga_id)
+            self.rollback(saga_id, session_id=session_id)
             raise SagaError(f"Action {action_name} failed; rollback attempted: {exc}") from exc
 
-    def commit(self, saga_id: str) -> dict[str, Any]:
-        saga = self._require(saga_id)
+    def commit(self, saga_id: str, *, session_id: str = "default") -> dict[str, Any]:
+        saga = self._require(saga_id, session_id)
         if saga["status"] != "ACTIVE":
             raise SagaError(f"Only ACTIVE sagas can commit (was {saga['status']})")
         self.store.execute("UPDATE sagas SET status='COMMITTED', updated_at=? WHERE id=?", (now(), saga_id))
-        return self.get(saga_id)
+        return self.get(saga_id, session_id=session_id)
 
-    def rollback(self, saga_id: str) -> dict[str, Any]:
-        saga = self._require(saga_id)
+    def rollback(self, saga_id: str, *, session_id: str = "default") -> dict[str, Any]:
+        saga = self._require(saga_id, session_id)
         if saga["status"] in ("COMMITTED", "ROLLED_BACK"):
             raise SagaError(f"Saga {saga_id} is already {saga['status']}")
         self.store.execute("UPDATE sagas SET status='ROLLING_BACK', updated_at=? WHERE id=?", (now(), saga_id))
@@ -84,15 +84,15 @@ class Coordinator:
                 self.store.execute("UPDATE steps SET status='COMPENSATION_FAILED', compensation_attempts=?, error=?, updated_at=? WHERE id=?", (self.compensation_retries, last_error, now(), step["id"]))
         status = "ROLLBACK_FAILED" if failures else "ROLLED_BACK"
         self.store.execute("UPDATE sagas SET status=?, error=?, updated_at=? WHERE id=?", (status, "; ".join(failures) or saga.get("error"), now(), saga_id))
-        return self.get(saga_id)
+        return self.get(saga_id, session_id=session_id)
 
-    def get(self, saga_id: str) -> dict[str, Any]:
-        saga = SagaStore.decode(self._require(saga_id))
+    def get(self, saga_id: str, *, session_id: str = "default") -> dict[str, Any]:
+        saga = SagaStore.decode(self._require(saga_id, session_id))
         saga["steps"] = [SagaStore.decode(row) for row in self.store.all("SELECT * FROM steps WHERE saga_id=? ORDER BY sequence", (saga_id,))]
         return saga
 
-    def _require(self, saga_id: str) -> dict[str, Any]:
-        row = self.store.one("SELECT * FROM sagas WHERE id=?", (saga_id,))
+    def _require(self, saga_id: str, session_id: str) -> dict[str, Any]:
+        row = self.store.one("SELECT * FROM sagas WHERE id=? AND session_id=?", (saga_id, session_id))
         if not row:
             raise SagaError(f"Saga not found: {saga_id}")
         return row
