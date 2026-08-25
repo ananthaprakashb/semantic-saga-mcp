@@ -1,8 +1,12 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+from semantic_saga_mcp.actions import DryRunHttpAction, FileTransactionTool, HttpAction, HttpRequest
 from semantic_saga_mcp.coordinator import Coordinator, SagaError
-from semantic_saga_mcp.server import McpServer
-from semantic_saga_mcp.store import SagaStore
+from semantic_saga_mcp.server import McpServer, SYSTEM_PROMPT
+from semantic_saga_mcp.store import SagaStore, SagaStoreProtocol, SQLiteSagaStore
 
 
 class FakeAction:
@@ -66,6 +70,22 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(response["id"], 1)
         self.assertEqual(response["result"]["structuredContent"]["status"], "ACTIVE")
 
+    def test_saga_system_prompt_is_listed_and_retrievable(self):
+        server = McpServer(self.coordinator)
+        listed = server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "prompts/list"})
+        self.assertEqual(listed["result"]["prompts"][0]["name"], "saga-coordinator")
+        self.assertEqual(listed["result"]["prompts"][0]["description"], SYSTEM_PROMPT)
+
+        fetched = server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "prompts/get", "params": {"name": "saga-coordinator"}})
+        self.assertEqual(fetched["result"]["messages"][0]["content"]["text"], SYSTEM_PROMPT)
+
+    def test_trigger_rollback_tool_compensates_saga(self):
+        server = McpServer(self.coordinator)
+        saga_id = self.coordinator.begin()["id"]
+        self.coordinator.execute(saga_id, "ok", {"value": 1})
+        response = server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "trigger_rollback", "arguments": {"saga_id": saga_id}}})
+        self.assertEqual(response["result"]["structuredContent"]["status"], "ROLLED_BACK")
+
     def test_sessions_cannot_read_or_rollback_each_others_sagas(self):
         server = McpServer(self.coordinator)
         begin = server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "begin_saga", "arguments": {}}}, "agent-a")
@@ -78,10 +98,76 @@ class CoordinatorTests(unittest.TestCase):
         server = McpServer(self.coordinator)
         response = server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "begin_saga", "arguments": {"metadata": "not-an-object"}}})
         self.assertEqual(response["error"]["code"], -32602)
-        self.assertEqual(self.coordinator.store.one("SELECT COUNT(*) AS n FROM sagas")["n"], 0)
+        self.assertEqual(self.coordinator.store.pending_rollbacks(), [])
 
         response = server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "get_saga", "arguments": {"saga_id": "x", "unexpected": True}}})
         self.assertEqual(response["error"]["code"], -32602)
+
+    def test_sqlite_resumes_uncertain_step_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/sagas.db"
+            first = SQLiteSagaStore(path)
+            saga = Coordinator(first, self.actions).begin(session_id="session")
+            timestamp = saga["created_at"]
+            first.create_step({"id": "uncertain", "saga_id": saga["id"], "action": "ok", "input": {"value": 9}, "status": "EXECUTING", "result": None, "error": None, "compensation_attempts": 0, "created_at": timestamp, "updated_at": timestamp})
+
+            restarted = Coordinator(SQLiteSagaStore(path), self.actions)
+            results = restarted.resume_pending_rollbacks()
+
+            self.assertIsInstance(restarted.store, SagaStoreProtocol)
+            self.assertEqual(results[0]["status"], "ROLLED_BACK")
+            self.assertEqual(self.events, [("undo", 9)])
+
+    def test_dry_run_logs_requests_and_never_calls_network(self):
+        messages = []
+        action = HttpAction(
+            HttpRequest("https://api.example/items", body={"value": "${input.value}"}, headers={"Authorization": "secret"}),
+            HttpRequest("https://api.example/items/cancel", body={"receipt": "${result.receipt}"}),
+        )
+        coordinator = Coordinator(SagaStore(), {"preview": DryRunHttpAction(action, messages.append)})
+        saga_id = coordinator.begin()["id"]
+
+        with patch("urllib.request.urlopen") as send, self.assertRaisesRegex(SagaError, "dry-run simulated failure"):
+            coordinator.execute(saga_id, "preview", {"value": 7})
+
+        send.assert_not_called()
+        self.assertEqual(coordinator.get(saga_id)["status"], "ROLLED_BACK")
+        self.assertIn('"body": {"value": 7}', messages[0])
+        self.assertIn('"Authorization": "<redacted>"', messages[0])
+        self.assertIn("[dry-run] compensation:", messages[1])
+
+    def test_file_transaction_failure_removes_prior_files_in_reverse_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            messages = []
+            coordinator = Coordinator(SagaStore(), {"create_text_file": FileTransactionTool(Path(directory), messages.append)})
+            saga_id = coordinator.begin()["id"]
+            for number in range(1, 4):
+                coordinator.execute(saga_id, "create_text_file", {"path": f"{number}.txt", "content": str(number)})
+
+            with self.assertRaisesRegex(SagaError, "simulated file transaction failure"):
+                coordinator.execute(saga_id, "create_text_file", {"path": "4.txt", "content": "4", "simulate_error": True})
+
+            self.assertEqual(coordinator.get(saga_id)["status"], "ROLLED_BACK")
+            self.assertEqual(list(Path(directory).glob("*.txt")), [])
+            deleted = [message for message in messages if "deleted" in message]
+            self.assertEqual([Path(message.rsplit(": ", 1)[1]).name for message in deleted], ["3.txt", "2.txt", "1.txt"])
+
+    def test_file_transaction_rejects_paths_outside_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = Coordinator(SagaStore(), {"create_text_file": FileTransactionTool(Path(directory))})
+            saga_id = coordinator.begin()["id"]
+            with self.assertRaisesRegex(SagaError, "inside the configured file root"):
+                coordinator.execute(saga_id, "create_text_file", {"path": "../escape.txt", "content": "no"})
+
+    def test_file_transaction_never_deletes_a_preexisting_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            existing = Path(directory) / "existing.txt"
+            existing.write_text("keep", encoding="utf-8")
+            coordinator = Coordinator(SagaStore(), {"create_text_file": FileTransactionTool(Path(directory))})
+            saga_id = coordinator.begin()["id"]
+            with self.assertRaisesRegex(SagaError, "already exists"):
+                coordinator.execute(saga_id, "create_text_file", {"path": "existing.txt", "content": "replace"})
+            self.assertEqual(existing.read_text(encoding="utf-8"), "keep")
 
 
 if __name__ == "__main__":
