@@ -1,0 +1,64 @@
+name: PostgreSQL CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-distributed:
+    name: PostgreSQL leases, fencing, and recovery
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: saga
+          POSTGRES_PASSWORD: saga
+          POSTGRES_DB: semantic_saga
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U saga -d semantic_saga"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SAGA_TEST_POSTGRES_DSN: postgresql://saga:saga@127.0.0.1:5432/semantic_saga
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install .
+      - name: Test distributed PostgreSQL guarantees
+        run: python -m unittest tests.test_postgres_store -v
+      - name: Smoke server startup on PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/postgres-server.log"
+          semantic-saga-mcp \
+            --transport streamable-http \
+            --host 127.0.0.1 --port 8125 \
+            --postgres-dsn "$SAGA_TEST_POSTGRES_DSN" \
+            --worker-id ci-worker \
+            --lease-seconds 2 \
+            >"$LOG" 2>&1 &
+          pid=$!
+          trap 'rc=$?; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; if [ "$rc" -ne 0 ]; then cat "$LOG"; fi; exit "$rc"' EXIT
+          python - <<'PY'
+          import socket, time
+          for _ in range(50):
+              try:
+                  with socket.create_connection(("127.0.0.1", 8125), timeout=0.2):
+                      break
+              except OSError:
+                  time.sleep(0.1)
+          else:
+              raise SystemExit("PostgreSQL-backed MCP server did not become ready")
+          PY

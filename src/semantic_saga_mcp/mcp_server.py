@@ -81,7 +81,12 @@ def build_mcp_server(
                     metadata = dict(args.metadata)
                     # Reserved system field: caller input can never spoof creator identity.
                     metadata["_identity"] = execution.audit_metadata()
-                    return coordinator.begin(metadata, session_id=execution.owner_id)
+                    return coordinator.begin(
+                        metadata,
+                        session_id=execution.owner_id,
+                        tenant_id=execution.tenant_id,
+                        principal_id=execution.principal_id,
+                    )
                 if isinstance(args, ExecuteArguments):
                     return coordinator.execute(
                         args.saga_id,
