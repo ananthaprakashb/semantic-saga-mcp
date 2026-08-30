@@ -84,6 +84,13 @@ PROMPTS = [
 
 
 class McpServer:
+    """Deprecated 2025-era JSON-RPC/SSE compatibility server.
+
+    New stdio and remote deployments use the official MCP v2 SDK. This class
+    remains only so existing dedicated-SSE integrations can migrate without an
+    immediate break.
+    """
+
     def __init__(self, coordinator: Coordinator) -> None:
         self.coordinator = coordinator
 
@@ -188,29 +195,88 @@ class McpServer:
         return Starlette(routes=[Route("/sse", sse, methods=["GET"]), Route("/messages", messages, methods=["POST"])])
 
 
+def _env_list(name: str) -> list[str]:
+    value = os.getenv(name, "")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Durable MCP saga coordinator")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--actions", default=os.getenv("SAGA_ACTIONS_FILE"), help="JSON action definitions")
     parser.add_argument("--file-root", default=os.getenv("SAGA_FILE_ROOT", "./saga-files"), help="Root directory for the built-in create_text_file action")
     parser.add_argument("--database", default=os.getenv("SAGA_DATABASE"), help="SQLite path (default: in-memory store)")
-    parser.add_argument("--transport", choices=("stdio", "sse"), default=os.getenv("SAGA_TRANSPORT", "stdio"))
+    parser.add_argument("--transport", choices=("stdio", "streamable-http", "sse"), default=os.getenv("SAGA_TRANSPORT", "stdio"))
     parser.add_argument("--host", default=os.getenv("SAGA_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("SAGA_PORT", "8000")))
+    parser.add_argument("--allowed-host", action="append", default=_env_list("SAGA_ALLOWED_HOSTS"), help="Allowed Host value for remote MCP; repeat or set SAGA_ALLOWED_HOSTS as CSV")
+    parser.add_argument("--allowed-origin", action="append", default=_env_list("SAGA_ALLOWED_ORIGINS"), help="Allowed Origin value for browser MCP clients; repeat or set SAGA_ALLOWED_ORIGINS as CSV")
+    parser.add_argument("--trust-identity-headers", action="store_true", default=os.getenv("SAGA_TRUST_IDENTITY_HEADERS", "").lower() in {"1", "true", "yes"}, help="Trust X-Semantic-Saga-Tenant/Principal from an authenticated reverse proxy")
+    parser.add_argument("--allow-unauthenticated-http", action="store_true", default=os.getenv("SAGA_ALLOW_UNAUTHENTICATED_HTTP", "").lower() in {"1", "true", "yes"}, help="Allow non-local Streamable HTTP without trusted proxy identity; private-network migration only")
     parser.add_argument("--dry-run", action="store_true", default=os.getenv("SAGA_DRY_RUN", "").lower() in {"1", "true", "yes"}, help="Preview actions, simulate failure, and log compensation without API calls")
     args = parser.parse_args()
+
+    local_hosts = {"127.0.0.1", "localhost", "::1"}
+    remote_streamable_http = args.transport == "streamable-http" and args.host not in local_hosts
+    if args.transport == "streamable-http":
+        if remote_streamable_http and not args.allowed_host:
+            parser.error("--allowed-host (or SAGA_ALLOWED_HOSTS) is required when Streamable HTTP binds beyond localhost")
+        if args.allowed_origin and not args.allowed_host:
+            parser.error("--allowed-origin requires at least one --allowed-host")
+        if remote_streamable_http and not args.trust_identity_headers and not args.allow_unauthenticated_http:
+            parser.error(
+                "non-local Streamable HTTP requires --trust-identity-headers behind an authenticated reverse proxy; "
+                "use --allow-unauthenticated-http only for a controlled private network"
+            )
+
     store = SQLiteSagaStore(args.database) if args.database else SagaStore()
     logger = lambda message: print(message, file=sys.stderr, flush=True)
     actions: dict[str, Action] = load_actions(args.actions, dry_run=args.dry_run, log=logger) if args.actions else {}
     actions["create_text_file"] = FileTransactionTool(Path(args.file_root), logger)
     coordinator = Coordinator(store, actions)
     coordinator.resume_pending_rollbacks()
-    server = McpServer(coordinator)
-    if args.transport == "stdio":
-        server.run_stdio()
-    else:
+
+    if args.transport == "sse":
+        print("[deprecated] dedicated SSE transport is retained only for migration; use --transport streamable-http", file=sys.stderr, flush=True)
         import uvicorn
-        uvicorn.run(server.sse_app(), host=args.host, port=args.port)
+
+        uvicorn.run(McpServer(coordinator).sse_app(), host=args.host, port=args.port)
+        return
+
+    from .execution import ExecutionContextResolver
+    from .mcp_server import build_mcp_server, run_stdio
+
+    resolver = ExecutionContextResolver(
+        trust_proxy_headers=args.trust_identity_headers,
+        require_proxy_identity=remote_streamable_http and not args.allow_unauthenticated_http,
+    )
+    mcp_server = build_mcp_server(coordinator, resolver)
+
+    if args.transport == "stdio":
+        import anyio
+
+        anyio.run(run_stdio, mcp_server)
+        return
+
+    from mcp.server.transport_security import TransportSecuritySettings
+    import uvicorn
+
+    transport_security = None
+    if args.allowed_host or args.allowed_origin:
+        transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=args.allowed_host,
+            allowed_origins=args.allowed_origin,
+        )
+
+    app = mcp_server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        transport_security=transport_security,
+        host=args.host,
+    )
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
