@@ -1,5 +1,10 @@
+import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+
+# Keep direct unittest discovery working from a source checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from semantic_saga_mcp.coordinator import Coordinator
 from semantic_saga_mcp.execution import ExecutionContextResolver
