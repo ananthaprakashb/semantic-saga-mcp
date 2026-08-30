@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 from . import __version__
 from .actions import Action, FileTransactionTool, load_actions
 from .coordinator import Coordinator, SagaError
-from .store import SagaStore, SQLiteSagaStore
+from .store import PostgresSagaStore, SagaStore, SQLiteSagaStore
 
 
 class StrictModel(BaseModel):
@@ -190,7 +190,13 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--actions", default=os.getenv("SAGA_ACTIONS_FILE"), help="JSON action definitions")
     parser.add_argument("--file-root", default=os.getenv("SAGA_FILE_ROOT", "./saga-files"), help="Root directory for the built-in create_text_file action")
-    parser.add_argument("--database", default=os.getenv("SAGA_DATABASE"), help="SQLite path (default: in-memory store)")
+    parser.add_argument("--database", default=os.getenv("SAGA_DATABASE"), help="SQLite path for single-node durable storage")
+    parser.add_argument("--postgres-dsn", default=os.getenv("SAGA_POSTGRES_DSN"), help="PostgreSQL DSN for horizontally scaled durable storage")
+    parser.add_argument("--postgres-pool-min", type=int, default=int(os.getenv("SAGA_POSTGRES_POOL_MIN", "1")), help="Minimum PostgreSQL connection-pool size")
+    parser.add_argument("--postgres-pool-max", type=int, default=int(os.getenv("SAGA_POSTGRES_POOL_MAX", "10")), help="Maximum PostgreSQL connection-pool size")
+    parser.add_argument("--worker-id", default=os.getenv("SAGA_WORKER_ID"), help="Unique worker identity; default is generated per process")
+    parser.add_argument("--lease-seconds", type=float, default=float(os.getenv("SAGA_LEASE_SECONDS", "30")), help="Saga mutation/recovery lease duration")
+    parser.add_argument("--recovery-limit", type=int, default=int(os.getenv("SAGA_RECOVERY_LIMIT", "100")), help="Maximum pending sagas claimed during startup recovery")
     parser.add_argument("--transport", choices=("stdio", "streamable-http", "sse"), default=os.getenv("SAGA_TRANSPORT", "stdio"))
     parser.add_argument("--host", default=os.getenv("SAGA_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("SAGA_PORT", "8000")))
@@ -214,6 +220,15 @@ def main() -> None:
     parser.add_argument("--allow-unauthenticated-http", action="store_true", default=os.getenv("SAGA_ALLOW_UNAUTHENTICATED_HTTP", "").lower() in {"1", "true", "yes"}, help="Allow non-local Streamable HTTP without native/proxy identity; private-network migration only")
     parser.add_argument("--dry-run", action="store_true", default=os.getenv("SAGA_DRY_RUN", "").lower() in {"1", "true", "yes"}, help="Preview actions, simulate failure, and log compensation without API calls")
     args = parser.parse_args()
+
+    if args.database and args.postgres_dsn:
+        parser.error("choose --database (SQLite) or --postgres-dsn, not both")
+    if args.postgres_pool_min < 1 or args.postgres_pool_max < args.postgres_pool_min:
+        parser.error("PostgreSQL pool sizes must satisfy 1 <= min <= max")
+    if args.lease_seconds <= 0:
+        parser.error("--lease-seconds must be positive")
+    if args.recovery_limit < 1:
+        parser.error("--recovery-limit must be positive")
 
     local_hosts = {"127.0.0.1", "localhost", "::1"}
     remote_streamable_http = args.transport == "streamable-http" and args.host not in local_hosts
@@ -241,12 +256,29 @@ def main() -> None:
                 "use --allow-unauthenticated-http only for a controlled private network"
             )
 
-    store = SQLiteSagaStore(args.database) if args.database else SagaStore()
+    if args.postgres_dsn:
+        store = PostgresSagaStore(
+            args.postgres_dsn,
+            min_pool_size=args.postgres_pool_min,
+            max_pool_size=args.postgres_pool_max,
+        )
+    elif args.database:
+        store = SQLiteSagaStore(args.database)
+    else:
+        store = SagaStore()
+
     logger = lambda message: print(message, file=sys.stderr, flush=True)
     actions: dict[str, Action] = load_actions(args.actions, dry_run=args.dry_run, log=logger) if args.actions else {}
     actions["create_text_file"] = FileTransactionTool(Path(args.file_root), logger)
-    coordinator = Coordinator(store, actions)
-    coordinator.resume_pending_rollbacks()
+    coordinator = Coordinator(
+        store,
+        actions,
+        worker_id=args.worker_id,
+        lease_seconds=args.lease_seconds,
+    )
+    recovered = coordinator.resume_pending_rollbacks(limit=args.recovery_limit)
+    if recovered:
+        logger(f"[recovery] worker {coordinator.worker_id} recovered {len(recovered)} saga(s)")
 
     if args.transport == "sse":
         print("[deprecated] dedicated SSE transport is retained only for migration; use --transport streamable-http", file=sys.stderr, flush=True)
