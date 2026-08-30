@@ -72,14 +72,120 @@ jobs:
                   assert not created.is_error, created
                   saga_id = created.structured_content["id"]
 
-              # A completely new HTTP client must still reach the same saga by
-              # explicit handle. Ownership is no longer tied to a transport session.
               async with Client(URL) as second:
                   assert second.protocol_version == "2026-07-28", second.protocol_version
                   fetched = await second.call_tool("get_saga", {"saga_id": saga_id})
                   assert not fetched.is_error, fetched
                   assert fetched.structured_content["id"] == saga_id
                   assert fetched.structured_content["status"] == "ACTIVE"
+
+          asyncio.run(main())
+          PY
+
+  auth-smoke:
+    name: OAuth tenant and RBAC smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install .
+      - name: Verify bearer gate, same-tenant handoff, RBAC, and tenant isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/semantic-saga-auth.log"
+          DB="$RUNNER_TEMP/semantic-saga-auth.db"
+          TOKENS="$RUNNER_TEMP/tokens.json"
+          cat >"$TOKENS" <<'JSON'
+          {
+            "operator-token": {
+              "client_id": "agent-client",
+              "subject": "alice",
+              "scopes": ["semantic-saga"],
+              "claims": {"tenant_id": "acme", "roles": ["operator"]}
+            },
+            "viewer-token": {
+              "client_id": "viewer-client",
+              "subject": "bob",
+              "scopes": ["semantic-saga"],
+              "claims": {"tenant_id": "acme", "roles": ["viewer"]}
+            },
+            "outsider-token": {
+              "client_id": "other-client",
+              "subject": "mallory",
+              "scopes": ["semantic-saga"],
+              "claims": {"tenant_id": "other", "roles": ["operator"]}
+            }
+          }
+          JSON
+
+          semantic-saga-mcp \
+            --transport streamable-http \
+            --host 127.0.0.1 --port 8124 \
+            --database "$DB" \
+            --auth-mode static \
+            --auth-static-tokens "$TOKENS" \
+            --auth-issuer https://auth.example.com \
+            --auth-resource-url http://127.0.0.1:8124/mcp \
+            --auth-required-scope semantic-saga \
+            >"$LOG" 2>&1 &
+          pid=$!
+          trap 'rc=$?; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; if [ "$rc" -ne 0 ]; then cat "$LOG"; fi; exit "$rc"' EXIT
+
+          python - <<'PY'
+          import socket
+          import time
+          for _ in range(50):
+              try:
+                  with socket.create_connection(("127.0.0.1", 8124), timeout=0.2):
+                      break
+              except OSError:
+                  time.sleep(0.1)
+          else:
+              raise SystemExit("OAuth MCP server did not become ready")
+          PY
+
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8124/mcp)" = "401"
+          curl -fsS http://127.0.0.1:8124/.well-known/oauth-protected-resource/mcp | grep -q 'https://auth.example.com/'
+
+          python - <<'PY'
+          import asyncio
+          import httpx2
+          from mcp import Client
+          from mcp.client.streamable_http import streamable_http_client
+
+          URL = "http://127.0.0.1:8124/mcp"
+
+          async def client_for(token: str):
+              http_client = httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"})
+              return http_client, Client(streamable_http_client(URL, http_client=http_client))
+
+          async def main() -> None:
+              operator_http, operator_target = await client_for("operator-token")
+              async with operator_http, operator_target as operator:
+                  created = await operator.call_tool("begin_saga", {"metadata": {"case": "phase2"}})
+                  assert not created.is_error, created
+                  saga_id = created.structured_content["id"]
+                  identity = created.structured_content["metadata"]["_identity"]
+                  assert identity["tenant_id"] == "acme"
+                  assert identity["principal_id"] == "alice"
+
+              viewer_http, viewer_target = await client_for("viewer-token")
+              async with viewer_http, viewer_target as viewer:
+                  fetched = await viewer.call_tool("get_saga", {"saga_id": saga_id})
+                  assert not fetched.is_error, fetched
+                  denied = await viewer.call_tool("commit_saga", {"saga_id": saga_id})
+                  assert denied.is_error, denied
+                  assert "not authorized" in denied.content[0].text
+
+              outsider_http, outsider_target = await client_for("outsider-token")
+              async with outsider_http, outsider_target as outsider:
+                  hidden = await outsider.call_tool("get_saga", {"saga_id": saga_id})
+                  assert hidden.is_error, hidden
+                  assert "Saga not found" in hidden.content[0].text
 
           asyncio.run(main())
           PY
