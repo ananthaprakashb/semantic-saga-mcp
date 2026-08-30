@@ -212,8 +212,22 @@ def main() -> None:
     parser.add_argument("--allowed-host", action="append", default=_env_list("SAGA_ALLOWED_HOSTS"), help="Allowed Host value for remote MCP; repeat or set SAGA_ALLOWED_HOSTS as CSV")
     parser.add_argument("--allowed-origin", action="append", default=_env_list("SAGA_ALLOWED_ORIGINS"), help="Allowed Origin value for browser MCP clients; repeat or set SAGA_ALLOWED_ORIGINS as CSV")
     parser.add_argument("--trust-identity-headers", action="store_true", default=os.getenv("SAGA_TRUST_IDENTITY_HEADERS", "").lower() in {"1", "true", "yes"}, help="Trust X-Semantic-Saga-Tenant/Principal from an authenticated reverse proxy")
+    parser.add_argument("--allow-unauthenticated-http", action="store_true", default=os.getenv("SAGA_ALLOW_UNAUTHENTICATED_HTTP", "").lower() in {"1", "true", "yes"}, help="Allow non-local Streamable HTTP without trusted proxy identity; private-network migration only")
     parser.add_argument("--dry-run", action="store_true", default=os.getenv("SAGA_DRY_RUN", "").lower() in {"1", "true", "yes"}, help="Preview actions, simulate failure, and log compensation without API calls")
     args = parser.parse_args()
+
+    local_hosts = {"127.0.0.1", "localhost", "::1"}
+    remote_streamable_http = args.transport == "streamable-http" and args.host not in local_hosts
+    if args.transport == "streamable-http":
+        if remote_streamable_http and not args.allowed_host:
+            parser.error("--allowed-host (or SAGA_ALLOWED_HOSTS) is required when Streamable HTTP binds beyond localhost")
+        if args.allowed_origin and not args.allowed_host:
+            parser.error("--allowed-origin requires at least one --allowed-host")
+        if remote_streamable_http and not args.trust_identity_headers and not args.allow_unauthenticated_http:
+            parser.error(
+                "non-local Streamable HTTP requires --trust-identity-headers behind an authenticated reverse proxy; "
+                "use --allow-unauthenticated-http only for a controlled private network"
+            )
 
     store = SQLiteSagaStore(args.database) if args.database else SagaStore()
     logger = lambda message: print(message, file=sys.stderr, flush=True)
@@ -232,7 +246,10 @@ def main() -> None:
     from .execution import ExecutionContextResolver
     from .mcp_server import build_mcp_server, run_stdio
 
-    resolver = ExecutionContextResolver(trust_proxy_headers=args.trust_identity_headers)
+    resolver = ExecutionContextResolver(
+        trust_proxy_headers=args.trust_identity_headers,
+        require_proxy_identity=remote_streamable_http and not args.allow_unauthenticated_http,
+    )
     mcp_server = build_mcp_server(coordinator, resolver)
 
     if args.transport == "stdio":
@@ -244,14 +261,8 @@ def main() -> None:
     from mcp.server.transport_security import TransportSecuritySettings
     import uvicorn
 
-    local_hosts = {"127.0.0.1", "localhost", "::1"}
-    if args.host not in local_hosts and not args.allowed_host:
-        parser.error("--allowed-host (or SAGA_ALLOWED_HOSTS) is required when Streamable HTTP binds beyond localhost")
-
     transport_security = None
     if args.allowed_host or args.allowed_origin:
-        if not args.allowed_host:
-            parser.error("--allowed-origin requires at least one --allowed-host")
         transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=args.allowed_host,
