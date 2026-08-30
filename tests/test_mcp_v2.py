@@ -61,6 +61,15 @@ class ExecutionContextTests(unittest.TestCase):
         self.assertNotEqual(first.owner_id, second.owner_id)
         self.assertEqual(first.identity_source, "trusted-proxy-header")
 
+    def test_protected_remote_mode_requires_proxy_principal(self):
+        resolver = ExecutionContextResolver(
+            trust_proxy_headers=True,
+            require_proxy_identity=True,
+        )
+        request = SimpleNamespace(headers={})
+        with self.assertRaisesRegex(ValueError, "proxy identity is required"):
+            resolver.resolve(SimpleNamespace(request=request))
+
 
 class OfficialMcpV2Tests(unittest.IsolatedAsyncioTestCase):
     async def test_modern_discovery_and_tools_use_same_explicit_saga_handle(self):
