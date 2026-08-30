@@ -1,0 +1,11 @@
+{
+  "replace-this-development-token": {
+    "client_id": "local-agent",
+    "subject": "alice",
+    "scopes": ["semantic-saga"],
+    "claims": {
+      "tenant_id": "example-org",
+      "roles": ["operator"]
+    }
+  }
+}
