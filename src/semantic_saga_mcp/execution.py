@@ -31,14 +31,24 @@ class ExecutionContextResolver:
     native OAuth/OIDC support.
 
     Proxy-provided tenant/principal headers are ignored unless explicitly
-    enabled by the server operator.
+    enabled by the server operator. A remote deployment can additionally require
+    that trusted proxy identity before any saga tool is executed.
     """
 
     TENANT_HEADER = "x-semantic-saga-tenant"
     PRINCIPAL_HEADER = "x-semantic-saga-principal"
 
-    def __init__(self, *, trust_proxy_headers: bool = False, local_owner_id: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        trust_proxy_headers: bool = False,
+        require_proxy_identity: bool = False,
+        local_owner_id: str | None = None,
+    ) -> None:
+        if require_proxy_identity and not trust_proxy_headers:
+            raise ValueError("require_proxy_identity needs trust_proxy_headers")
         self.trust_proxy_headers = trust_proxy_headers
+        self.require_proxy_identity = require_proxy_identity
         self.local_owner_id = local_owner_id or f"stdio:{uuid.uuid4()}"
 
     @staticmethod
@@ -67,6 +77,11 @@ class ExecutionContextResolver:
                     identity_source="trusted-proxy-header",
                     tenant_id=tenant,
                     principal_id=principal,
+                )
+            if self.require_proxy_identity:
+                raise ValueError(
+                    "Authenticated proxy identity is required; missing "
+                    f"{self.PRINCIPAL_HEADER}"
                 )
 
         authorization = headers.get("authorization")
