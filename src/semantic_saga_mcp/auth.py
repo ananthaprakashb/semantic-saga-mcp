@@ -73,7 +73,9 @@ class JwtTokenVerifier(TokenVerifier):
         jwks_url: str,
         algorithms: Iterable[str] = ("RS256",),
     ) -> None:
-        self.issuer = issuer.rstrip("/")
+        # OAuth/OIDC issuer identifiers are exact values; a trailing slash can be
+        # significant, so never normalize what the operator configured.
+        self.issuer = issuer
         self.audience = audience
         self.algorithms = tuple(algorithms)
         if not self.algorithms:
