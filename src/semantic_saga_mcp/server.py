@@ -84,12 +84,7 @@ PROMPTS = [
 
 
 class McpServer:
-    """Deprecated 2025-era JSON-RPC/SSE compatibility server.
-
-    New stdio and remote deployments use the official MCP v2 SDK. This class
-    remains only so existing dedicated-SSE integrations can migrate without an
-    immediate break.
-    """
+    """Deprecated 2025-era JSON-RPC/SSE compatibility server."""
 
     def __init__(self, coordinator: Coordinator) -> None:
         self.coordinator = coordinator
@@ -144,16 +139,6 @@ class McpServer:
     @staticmethod
     def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
-
-    def run_stdio(self) -> None:
-        session_id = f"stdio:{uuid.uuid4()}"
-        for line in sys.stdin:
-            try:
-                response = self.dispatch(json.loads(line), session_id)
-                if response is not None:
-                    print(json.dumps(response, separators=(",", ":")), flush=True)
-            except json.JSONDecodeError as exc:
-                print(json.dumps(self._error(None, -32700, f"Parse error: {exc}")), flush=True)
 
     def sse_app(self) -> Any:
         from starlette.applications import Starlette
@@ -211,21 +196,48 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.getenv("SAGA_PORT", "8000")))
     parser.add_argument("--allowed-host", action="append", default=_env_list("SAGA_ALLOWED_HOSTS"), help="Allowed Host value for remote MCP; repeat or set SAGA_ALLOWED_HOSTS as CSV")
     parser.add_argument("--allowed-origin", action="append", default=_env_list("SAGA_ALLOWED_ORIGINS"), help="Allowed Origin value for browser MCP clients; repeat or set SAGA_ALLOWED_ORIGINS as CSV")
-    parser.add_argument("--trust-identity-headers", action="store_true", default=os.getenv("SAGA_TRUST_IDENTITY_HEADERS", "").lower() in {"1", "true", "yes"}, help="Trust X-Semantic-Saga-Tenant/Principal from an authenticated reverse proxy")
-    parser.add_argument("--allow-unauthenticated-http", action="store_true", default=os.getenv("SAGA_ALLOW_UNAUTHENTICATED_HTTP", "").lower() in {"1", "true", "yes"}, help="Allow non-local Streamable HTTP without trusted proxy identity; private-network migration only")
+
+    parser.add_argument("--auth-mode", choices=("none", "jwt", "static"), default=os.getenv("SAGA_AUTH_MODE", "none"), help="Native OAuth bearer-token verification mode for Streamable HTTP")
+    parser.add_argument("--auth-issuer", default=os.getenv("SAGA_AUTH_ISSUER"), help="OAuth/OIDC issuer URL advertised in protected-resource metadata")
+    parser.add_argument("--auth-resource-url", default=os.getenv("SAGA_AUTH_RESOURCE_URL"), help="Public MCP resource URL, for example https://mcp.example.com/mcp")
+    parser.add_argument("--auth-audience", default=os.getenv("SAGA_AUTH_AUDIENCE"), help="Expected aud claim for JWT access tokens")
+    parser.add_argument("--auth-jwks-url", default=os.getenv("SAGA_AUTH_JWKS_URL"), help="IdP JWKS endpoint for signed JWT verification")
+    parser.add_argument("--auth-jwt-algorithm", action="append", default=_env_list("SAGA_AUTH_JWT_ALGORITHMS") or ["RS256"], help="Allowed JWT signing algorithm; repeat for multiple")
+    parser.add_argument("--auth-static-tokens", default=os.getenv("SAGA_AUTH_STATIC_TOKENS"), help="Operator-owned JSON token file for development/testing only")
+    parser.add_argument("--auth-required-scope", action="append", default=_env_list("SAGA_AUTH_REQUIRED_SCOPES"), help="OAuth scope required by MCP auth middleware; repeat for multiple")
+    parser.add_argument("--auth-tenant-claim", action="append", default=_env_list("SAGA_AUTH_TENANT_CLAIMS") or ["tenant_id", "tid", "org_id"], help="Token claim used as tenant ID; repeat to define fallbacks")
+    parser.add_argument("--auth-roles-claim", default=os.getenv("SAGA_AUTH_ROLES_CLAIM", "roles"), help="Token claim containing viewer/operator/admin roles")
+    parser.add_argument("--auth-principal-type-claim", default=os.getenv("SAGA_AUTH_PRINCIPAL_TYPE_CLAIM", "principal_type"), help="Token claim identifying user/service principal type")
+    parser.add_argument("--auth-allow-missing-tenant", action="store_true", default=os.getenv("SAGA_AUTH_ALLOW_MISSING_TENANT", "").lower() in {"1", "true", "yes"}, help="Use tenant 'default' when an authenticated token has no configured tenant claim")
+
+    parser.add_argument("--trust-identity-headers", action="store_true", default=os.getenv("SAGA_TRUST_IDENTITY_HEADERS", "").lower() in {"1", "true", "yes"}, help="Migration mode: trust identity headers from an authenticated reverse proxy")
+    parser.add_argument("--allow-unauthenticated-http", action="store_true", default=os.getenv("SAGA_ALLOW_UNAUTHENTICATED_HTTP", "").lower() in {"1", "true", "yes"}, help="Allow non-local Streamable HTTP without native/proxy identity; private-network migration only")
     parser.add_argument("--dry-run", action="store_true", default=os.getenv("SAGA_DRY_RUN", "").lower() in {"1", "true", "yes"}, help="Preview actions, simulate failure, and log compensation without API calls")
     args = parser.parse_args()
 
     local_hosts = {"127.0.0.1", "localhost", "::1"}
     remote_streamable_http = args.transport == "streamable-http" and args.host not in local_hosts
+    native_auth = args.auth_mode != "none"
+
+    if native_auth and args.transport != "streamable-http":
+        parser.error("native OAuth authentication is supported only with --transport streamable-http")
+    if native_auth and args.trust_identity_headers:
+        parser.error("choose native OAuth authentication or trusted proxy identity headers, not both")
+    if native_auth and (not args.auth_issuer or not args.auth_resource_url):
+        parser.error("--auth-issuer and --auth-resource-url are required when native auth is enabled")
+    if args.auth_mode == "jwt" and (not args.auth_audience or not args.auth_jwks_url):
+        parser.error("JWT auth requires --auth-audience and --auth-jwks-url")
+    if args.auth_mode == "static" and not args.auth_static_tokens:
+        parser.error("static auth requires --auth-static-tokens")
+
     if args.transport == "streamable-http":
         if remote_streamable_http and not args.allowed_host:
             parser.error("--allowed-host (or SAGA_ALLOWED_HOSTS) is required when Streamable HTTP binds beyond localhost")
         if args.allowed_origin and not args.allowed_host:
             parser.error("--allowed-origin requires at least one --allowed-host")
-        if remote_streamable_http and not args.trust_identity_headers and not args.allow_unauthenticated_http:
+        if remote_streamable_http and not native_auth and not args.trust_identity_headers and not args.allow_unauthenticated_http:
             parser.error(
-                "non-local Streamable HTTP requires --trust-identity-headers behind an authenticated reverse proxy; "
+                "non-local Streamable HTTP requires native OAuth or --trust-identity-headers behind an authenticated proxy; "
                 "use --allow-unauthenticated-http only for a controlled private network"
             )
 
@@ -248,7 +260,12 @@ def main() -> None:
 
     resolver = ExecutionContextResolver(
         trust_proxy_headers=args.trust_identity_headers,
-        require_proxy_identity=remote_streamable_http and not args.allow_unauthenticated_http,
+        require_proxy_identity=remote_streamable_http and args.trust_identity_headers and not args.allow_unauthenticated_http,
+        allow_anonymous_http=args.transport == "streamable-http" and not native_auth and (not remote_streamable_http or args.allow_unauthenticated_http),
+        tenant_claims=args.auth_tenant_claim,
+        roles_claim=args.auth_roles_claim,
+        principal_type_claim=args.auth_principal_type_claim,
+        allow_missing_tenant=args.auth_allow_missing_tenant,
     )
     mcp_server = build_mcp_server(coordinator, resolver)
 
@@ -258,7 +275,9 @@ def main() -> None:
         anyio.run(run_stdio, mcp_server)
         return
 
+    from mcp.server.auth.settings import AuthSettings
     from mcp.server.transport_security import TransportSecuritySettings
+    from pydantic import AnyHttpUrl
     import uvicorn
 
     transport_security = None
@@ -269,12 +288,34 @@ def main() -> None:
             allowed_origins=args.allowed_origin,
         )
 
+    auth_settings = None
+    token_verifier = None
+    if native_auth:
+        from .auth import JwtTokenVerifier, StaticTokenVerifier
+
+        auth_settings = AuthSettings(
+            issuer_url=AnyHttpUrl(args.auth_issuer),
+            resource_server_url=AnyHttpUrl(args.auth_resource_url),
+            required_scopes=args.auth_required_scope,
+        )
+        if args.auth_mode == "jwt":
+            token_verifier = JwtTokenVerifier(
+                issuer=args.auth_issuer,
+                audience=args.auth_audience,
+                jwks_url=args.auth_jwks_url,
+                algorithms=args.auth_jwt_algorithm,
+            )
+        else:
+            token_verifier = StaticTokenVerifier.from_file(args.auth_static_tokens)
+
     app = mcp_server.streamable_http_app(
         streamable_http_path="/mcp",
         json_response=True,
         stateless_http=True,
         transport_security=transport_security,
         host=args.host,
+        auth=auth_settings,
+        token_verifier=token_verifier,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 
