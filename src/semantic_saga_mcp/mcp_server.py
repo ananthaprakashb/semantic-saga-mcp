@@ -21,6 +21,7 @@ from mcp.types import (
 from pydantic import ValidationError
 
 from . import __version__
+from .auth import AuthorizationError, AuthorizationPolicy, IdentityError
 from .coordinator import Coordinator, SagaError
 from .execution import ExecutionContextResolver
 from .server import ARGUMENT_MODELS, BeginArguments, ExecuteArguments, SYSTEM_PROMPT, TOOLS
@@ -48,7 +49,12 @@ def _tool_error(message: str) -> CallToolResult:
     )
 
 
-def build_mcp_server(coordinator: Coordinator, resolver: ExecutionContextResolver) -> Server:
+def build_mcp_server(
+    coordinator: Coordinator,
+    resolver: ExecutionContextResolver,
+    policy: AuthorizationPolicy | None = None,
+) -> Server:
+    policy = policy or AuthorizationPolicy()
     tools = [
         Tool(
             name=definition["name"],
@@ -68,10 +74,14 @@ def build_mcp_server(coordinator: Coordinator, resolver: ExecutionContextResolve
         try:
             args = model.model_validate(params.arguments or {})
             execution = resolver.resolve(ctx)
+            policy.authorize(params.name, roles=execution.roles, scopes=execution.scopes)
 
             def invoke() -> dict[str, Any]:
                 if isinstance(args, BeginArguments):
-                    return coordinator.begin(args.metadata, session_id=execution.owner_id)
+                    metadata = dict(args.metadata)
+                    # Reserved system field: caller input can never spoof creator identity.
+                    metadata["_identity"] = execution.audit_metadata()
+                    return coordinator.begin(metadata, session_id=execution.owner_id)
                 if isinstance(args, ExecuteArguments):
                     return coordinator.execute(
                         args.saga_id,
@@ -89,7 +99,7 @@ def build_mcp_server(coordinator: Coordinator, resolver: ExecutionContextResolve
             return _tool_result(value)
         except ValidationError as exc:
             return _tool_error(f"Invalid arguments: {exc}")
-        except (SagaError, KeyError, TypeError, ValueError) as exc:
+        except (IdentityError, AuthorizationError, SagaError, KeyError, TypeError, ValueError) as exc:
             return _tool_error(str(exc))
         except Exception as exc:
             return _tool_error(f"Internal error: {exc}")

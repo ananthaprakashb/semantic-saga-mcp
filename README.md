@@ -1,8 +1,8 @@
 # semantic-saga-mcp
 
-A standalone [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that applies the Saga pattern to agentic workflows. It executes allow-listed side effects, journals their state, and automatically invokes compensating actions in reverse order when a step fails or the MCP client requests rollback.
+A standalone [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that applies the Saga pattern to agentic workflows. It executes allow-listed side effects, journals their state, and automatically invokes compensating actions in reverse order when a step fails or an authorized MCP client requests rollback.
 
-Version 0.2 uses the official MCP Python SDK v2 for modern stdio and Streamable HTTP. It supports the MCP `2026-07-28` stateless request model while retaining compatibility with older handshake-era clients through the SDK. The old dedicated HTTP+SSE transport remains available only as a deprecated migration path.
+Version 0.3 builds an enterprise identity layer on the MCP `2026-07-28` stateless foundation: native OAuth bearer-token verification for Streamable HTTP, tenant-scoped saga ownership, user and service principals, RBAC, and cross-tenant isolation. The old dedicated HTTP+SSE transport remains available only as a deprecated migration path.
 
 ## Guarantees
 
@@ -10,11 +10,15 @@ Version 0.2 uses the official MCP Python SDK v2 for modern stdio and Streamable 
 - **Automatic rollback:** a failed step changes the saga to failed and rolls back it and previously completed steps. The failed request is included because a network error may occur after a remote mutation.
 - **Reverse-order compensation:** completed mutations unwind from newest to oldest.
 - **Idempotency:** forward and compensation requests receive stable `Idempotency-Key` headers. Endpoints **must honor these keys** because networks cannot provide exactly-once delivery.
-- **Pluggable storage:** the dependency-free in-memory store is the default. A durable adapter enables recovery after a restart, and the storage protocol keeps the coordinator independent of SQLite, Redis, or PostgreSQL.
-- **Transport-independent ownership:** modern HTTP saga access is scoped by a stable execution identity rather than a sticky MCP transport session, so a new connection can continue a durable saga by explicit `saga_id` when it has the same ownership scope.
-- **Strict schema enforcement:** Pydantic strict models reject missing, mistyped, or unexpected tool arguments before coordinator code can run, including when requests arrive through the official low-level MCP SDK.
+- **Pluggable storage:** the dependency-free in-memory store is the default. SQLite provides durable local recovery, and the storage protocol keeps the coordinator independent of SQLite, Redis, or PostgreSQL.
+- **Transport-independent workflows:** `saga_id` is the durable workflow handle; remote continuation does not depend on a sticky MCP connection.
+- **Tenant isolation:** authenticated HTTP sagas are owned by the organization/tenant. Authorized users and service principals in the same tenant can continue a saga; other tenants see it as not found.
+- **Native OAuth resource-server mode:** production HTTP deployments can validate signed JWT access tokens using configured issuer, audience, JWKS, signing algorithms, and expiration checks.
+- **RBAC and scopes:** `viewer`, `operator`, and `admin` roles plus `semantic-saga:read`, `semantic-saga:execute`, and `semantic-saga:admin` scopes restrict tool execution.
+- **Creator attribution:** the server records the creating principal under reserved `metadata._identity`; caller metadata cannot spoof that field.
+- **Strict schema enforcement:** Pydantic strict models reject missing, mistyped, or unexpected tool arguments before coordinator code can run.
 - **Safe action surface:** agents select administrator-configured actions; they cannot supply arbitrary URLs or credentials.
-- **Fail-closed remote binding:** non-local Streamable HTTP requires an explicit Host allowlist and, by default, a trusted reverse-proxy identity before saga tools can execute.
+- **Fail-closed remote binding:** non-local Streamable HTTP requires an explicit Host allowlist and authenticated identity unless the operator deliberately enables the private-network escape hatch.
 
 This is a coordination framework, not an ACID transaction spanning independent systems. A compensation can itself fail. That state is reported as `ROLLBACK_FAILED` for operator or client retry rather than being hidden.
 
@@ -27,9 +31,7 @@ python -m pip install -e .
 semantic-saga-mcp
 ```
 
-Installing the package is recommended because it also installs runtime dependencies. Tests can nevertheless import the `src` layout directly from a checkout, so `python -m unittest discover -s tests -v` does not require an editable install after dependencies have been installed.
-
-Example MCP client configuration:
+Example local MCP client configuration:
 
 ```json
 {
@@ -58,19 +60,7 @@ The demo creates `demo-1.txt`, `demo-2.txt`, and `demo-3.txt`, deliberately fail
 
 ### Claude Desktop
 
-A ready-to-customize Claude Desktop configuration is provided at [`docs/claude_desktop_config.json`](docs/claude_desktop_config.json). To use it locally:
-
-1. From this repository, create a virtual environment and install the server:
-
-   ```bash
-   python -m venv .venv
-   .venv/bin/python -m pip install -e .
-   ```
-
-2. In the JSON file, replace every `/ABSOLUTE/PATH/TO/semantic-saga-mcp` with this repository's absolute path.
-3. Copy the resulting `mcpServers.semantic-saga` entry into the `mcpServers` object in your Claude Desktop configuration, then restart Claude Desktop.
-
-The configuration starts the local stdio transport, enables durable SQLite recovery, and places files created by the built-in `create_text_file` action in this repository's `saga-files` directory. No HTTP action configuration is required for the file transaction demo.
+A ready-to-customize Claude Desktop configuration is provided at [`docs/claude_desktop_config.json`](docs/claude_desktop_config.json). It uses the local stdio transport and can enable durable SQLite recovery without any remote authentication setup.
 
 ### Dry run
 
@@ -80,11 +70,11 @@ Pass `--dry-run` (or set `SAGA_DRY_RUN=true`) to validate a failure and rollback
 
 Without `--database`, the server uses `SagaStore`, a thread-safe in-memory adapter. This is convenient for development, but its journal disappears when the process exits. Enable the included durable SQLite adapter with `--database ./semantic-saga.db`. On startup, the server finds interrupted rollbacks and uncertain `EXECUTING` steps in durable storage and resumes compensation automatically.
 
-Developers can plug in Redis or PostgreSQL without changing the coordinator by implementing `SagaStoreProtocol` from `semantic_saga_mcp.store`. Its domain-level methods cover saga and step creation, lookup, updates, ordered step listing, and recovery discovery. Mutations in a durable implementation must be committed before returning; `create_step` must also allocate its per-saga sequence atomically. Inject the adapter with `Coordinator(custom_store, actions)` and invoke `resume_pending_rollbacks()` once the action registry is available during application startup.
+Developers can plug in Redis or PostgreSQL without changing the coordinator by implementing `SagaStoreProtocol` from `semantic_saga_mcp.store`. Mutations in a durable implementation must be committed before returning; `create_step` must also allocate its per-saga sequence atomically.
 
 ## Remote Streamable HTTP
 
-The default `stdio` transport is intended for local IDE and desktop integrations. For a local HTTP integration, run:
+For local development, Streamable HTTP can run on loopback without OAuth:
 
 ```bash
 semantic-saga-mcp --transport streamable-http \
@@ -93,47 +83,92 @@ semantic-saga-mcp --transport streamable-http \
   --database ./semantic-saga.db
 ```
 
-Clients connect to `http://127.0.0.1:8000/mcp`. The official MCP SDK handles modern `2026-07-28` discovery and older initialization-era compatibility on this endpoint. Modern requests are not owned by an MCP transport session; the explicit `saga_id` is the durable workflow handle.
+Clients connect to `http://127.0.0.1:8000/mcp`. The official MCP SDK serves the modern `2026-07-28` protocol. A completely new connection can continue the same durable saga using its explicit `saga_id`.
 
-### Non-local deployment
+### Production OAuth/JWT deployment
 
-For a real hostname, put Semantic Saga behind TLS and an authenticated reverse proxy. The server requires an explicit Host allowlist and trusted identity mode when binding beyond localhost:
+For a public or organization-wide endpoint, Semantic Saga acts as an OAuth resource server. Your existing identity provider issues access tokens; Semantic Saga validates them and publishes MCP/RFC 9728 protected-resource metadata.
 
 ```bash
-semantic-saga-mcp --transport streamable-http \
+semantic-saga-mcp \
+  --transport streamable-http \
   --host 0.0.0.0 --port 8000 \
   --allowed-host mcp.example.com \
   --allowed-host 'mcp.example.com:*' \
   --allowed-origin https://agents.example.com \
-  --trust-identity-headers \
+  --auth-mode jwt \
+  --auth-issuer https://idp.example.com/ \
+  --auth-resource-url https://mcp.example.com/mcp \
+  --auth-audience https://mcp.example.com \
+  --auth-jwks-url https://idp.example.com/.well-known/jwks.json \
+  --auth-required-scope semantic-saga \
   --actions ./examples/actions.json \
   --database ./semantic-saga.db
 ```
 
-The authenticated proxy must:
+JWT verification checks the configured issuer exactly, the intended audience, token expiration, signature, and permitted signing algorithm. The public `--auth-resource-url` should be the MCP URL that clients use, not an internal container or proxy address.
 
-1. authenticate the caller before forwarding `/mcp`;
-2. remove any inbound client-supplied `X-Semantic-Saga-Tenant` and `X-Semantic-Saga-Principal` headers;
-3. inject a validated `X-Semantic-Saga-Principal` on every forwarded request, plus `X-Semantic-Saga-Tenant` when tenant scoping is available; and
-4. prevent clients from bypassing the proxy and reaching the Semantic Saga process directly.
+By default, Semantic Saga looks for a tenant in `tenant_id`, then `tid`, then `org_id`; roles come from `roles`. Those claim names are configurable. Missing tenant identity is rejected by default rather than silently combining unrelated callers into one tenant.
 
-The server hashes the tenant/principal pair before using it as the stored ownership scope. Raw proxy identity is not written into the saga ownership key. If an HTTP `Authorization` header is present outside protected proxy mode, its value is also hashed for ownership isolation; **that hashing does not validate or authenticate the credential**.
+See [`docs/enterprise_identity.md`](docs/enterprise_identity.md) for the complete identity model, service-principal examples, claim configuration, and deployment guidance.
 
-Native MCP OAuth/OIDC authorization is intentionally deferred to the enterprise identity phase. Until then, the trusted reverse proxy is the security boundary for non-local deployment.
+### Authorization model
 
-`--allow-unauthenticated-http` (or `SAGA_ALLOW_UNAUTHENTICATED_HTTP=true`) bypasses the remote identity requirement. It exists for controlled private-network migration and should not be used for an internet-facing action server.
+| Identity | Read saga | Begin / execute | Commit / rollback |
+| --- | --- | --- | --- |
+| `viewer` | yes | no | no |
+| `operator` | yes | yes | yes |
+| `admin` | yes | yes | yes |
 
-Environment variables for remote transport include `SAGA_TRANSPORT`, `SAGA_HOST`, `SAGA_PORT`, `SAGA_ALLOWED_HOSTS`, `SAGA_ALLOWED_ORIGINS`, `SAGA_TRUST_IDENTITY_HEADERS`, and `SAGA_ALLOW_UNAUTHENTICATED_HTTP`. Host and Origin lists are comma-separated.
+OAuth scopes can grant equivalent machine permissions:
+
+- `semantic-saga:read` — inspect saga state.
+- `semantic-saga:execute` — read and mutate sagas.
+- `semantic-saga:admin` — all current saga tools.
+
+A separate base scope can also be required by the MCP authentication middleware with `--auth-required-scope`.
+
+### User and service-principal handoff
+
+Remote saga ownership is tenant-scoped rather than principal-scoped. For example:
+
+```text
+alice@acme          deployment-agent@acme          mallory@other
+    │                         │                          │
+    ├─ begin_saga()           │                          │
+    │      saga-123           │                          │
+    │                         ├─ get_saga(saga-123) ✓   │
+    │                         └─ continue if authorized │
+    │                                                    └─ get_saga(saga-123) → not found
+```
+
+The creating identity remains visible in `metadata._identity`, including its tenant, principal, principal type, roles, and identity source.
+
+### Static auth for local demos and CI
+
+`--auth-mode static` loads an operator-owned JSON mapping of bearer tokens to verified identity records. It exists only for tests and controlled demos; it is not a production credential database.
+
+A safe placeholder file is provided at [`examples/static_tokens.example.json`](examples/static_tokens.example.json).
+
+### Trusted reverse-proxy migration mode
+
+Deployments that already authenticate at a gateway can continue to use `--trust-identity-headers` instead of native OAuth. This mode is mutually exclusive with `--auth-mode jwt|static`.
+
+The proxy must strip caller-supplied identity headers, inject validated `X-Semantic-Saga-Tenant`, `X-Semantic-Saga-Principal`, optional `X-Semantic-Saga-Principal-Type`, and `X-Semantic-Saga-Roles`, and prevent clients from bypassing the proxy.
+
+### Private-network escape hatch
+
+`--allow-unauthenticated-http` (or `SAGA_ALLOW_UNAUTHENTICATED_HTTP=true`) bypasses the non-local identity requirement. It exists for controlled private-network migration only and should not be used for an internet-facing action server.
 
 ### Deprecated dedicated SSE transport
 
-The previous dedicated SSE transport is retained temporarily for migration:
+The previous dedicated SSE transport remains temporarily available for migration:
 
 ```bash
 semantic-saga-mcp --transport sse --host 127.0.0.1 --port 8000
 ```
 
-It uses `GET /sse` plus a session-specific `POST /messages?session_id=...` endpoint and retains the older `2025-06-18` behavior. New deployments should use Streamable HTTP instead.
+It uses `GET /sse` plus a session-specific `POST /messages?session_id=...` endpoint and retains the older `2025-06-18` behavior. New deployments should use Streamable HTTP.
 
 ## Configure actions
 
@@ -159,7 +194,7 @@ Action configuration is controlled by the server operator. Each action pairs one
 }
 ```
 
-An entire string may be a typed template value. Supported roots are `input`, `result`, `saga`, and `step`, for example `${input.amount}`, `${result.charge_id}`, `${saga.id}`, and `${step.id}`. Do not commit secrets in an action file; generate a protected runtime configuration instead.
+An entire string may be a typed template value. Supported roots are `input`, `result`, `saga`, and `step`, for example `${input.amount}`, `${result.charge_id}`, `${saga.id}`, and `${step.id}`. Do not commit secrets in an action file; generate protected runtime configuration instead.
 
 ## MCP tools
 
@@ -174,14 +209,14 @@ An entire string may be a typed template value. Supported roots are `input`, `re
 
 ## MCP prompt
 
-The `saga-coordinator` prompt is advertised through `prompts/list` and returned by `prompts/get`. It tells an LLM to wrap multi-step infrastructure changes in the Saga Coordinator and to invoke `trigger_rollback` immediately after an error.
+The `saga-coordinator` prompt tells an LLM to wrap multi-step infrastructure changes in the Saga Coordinator and to invoke `trigger_rollback` immediately after an error.
 
 A typical client flow is:
 
 1. Call `begin_saga` and retain `id`.
 2. Call `execute_saga_step` for each mutation with that `saga_id`.
 3. Call `commit_saga` only when the whole workflow is accepted.
-4. Call `rollback_saga` on a client-side validation error or hallucination. Server-side action errors trigger this automatically.
+4. Call `rollback_saga` on a client-side validation error or hallucination. Server-side action errors trigger rollback automatically.
 
 ## Development
 
@@ -189,7 +224,7 @@ A typical client flow is:
 python -m unittest discover -s tests -v
 ```
 
-Pull requests also run CI across Python 3.10-3.13, build the package, and perform a real Streamable HTTP smoke test. That smoke test creates a saga through one MCP HTTP client, disconnects it, and retrieves the same saga through a new client to verify transport-stateless continuation.
+Pull requests run CI across Python 3.10–3.13, build and validate the package, exercise a two-client stateless Streamable HTTP continuation, and run an authenticated HTTP scenario that verifies 401 gating, protected-resource discovery, same-tenant handoff, viewer mutation denial, and cross-tenant isolation.
 
 The stdio transport writes only MCP protocol messages to stdout. Keep application diagnostics on stderr so clients can parse the protocol stream.
 
