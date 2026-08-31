@@ -31,6 +31,19 @@ def _primitive_attributes(values: Mapping[str, Any] | None) -> dict[str, Any]:
     return result
 
 
+def _parse_otlp_headers(value: str | None) -> dict[str, str] | None:
+    if not value:
+        return None
+    result: dict[str, str] = {}
+    for item in value.split(","):
+        key, separator, header_value = item.partition("=")
+        key = key.strip()
+        if not separator or not key:
+            raise RuntimeError("OTLP headers must use comma-separated key=value entries")
+        result[key] = header_value.strip()
+    return result
+
+
 def current_trace_ids() -> tuple[str | None, str | None]:
     span = trace.get_current_span()
     span_context = span.get_span_context()
@@ -195,6 +208,7 @@ def configure_telemetry(
     pay for the SDK/exporter dependency unless they need it.
     """
     endpoint = endpoint or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    exporter_headers = _parse_otlp_headers(headers or os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
     if endpoint:
         try:
             from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
@@ -210,14 +224,15 @@ def configure_telemetry(
             ) from exc
 
         resource = Resource.create({"service.name": service_name})
+        base_endpoint = endpoint.rstrip("/")
         trace_provider = TracerProvider(resource=resource)
         trace_provider.add_span_processor(
-            BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint.rstrip("/") + "/v1/traces", headers=headers))
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=base_endpoint + "/v1/traces", headers=exporter_headers))
         )
         trace.set_tracer_provider(trace_provider)
 
         metric_reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(endpoint=endpoint.rstrip("/") + "/v1/metrics", headers=headers)
+            OTLPMetricExporter(endpoint=base_endpoint + "/v1/metrics", headers=exporter_headers)
         )
         metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
 
