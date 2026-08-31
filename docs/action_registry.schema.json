@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-saga.example/schemas/action-registry-v1.json",
+  "title": "Semantic Saga Action Registry v1",
+  "type": "object",
+  "required": ["schema_version", "actions"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "actions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/action"}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "secretHeader": {
+      "type": "object",
+      "required": ["secret_ref"],
+      "properties": {
+        "secret_ref": {"type": "string", "minLength": 1},
+        "prefix": {"type": "string"},
+        "suffix": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "required": ["url"],
+      "properties": {
+        "url": {"type": "string", "minLength": 1},
+        "method": {"type": "string", "minLength": 1},
+        "body": {},
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              {"type": "string"},
+              {"$ref": "#/$defs/secretHeader"}
+            ]
+          }
+        },
+        "timeout_seconds": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "action": {
+      "type": "object",
+      "required": ["id", "version", "kind", "input_schema", "forward", "compensation"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "kind": {"const": "http"},
+        "active": {"type": "boolean", "default": true},
+        "semantic": {"type": "object"},
+        "input_schema": {"type": "object"},
+        "output_schema": {"type": "object"},
+        "forward": {"$ref": "#/$defs/request"},
+        "compensation": {"$ref": "#/$defs/request"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

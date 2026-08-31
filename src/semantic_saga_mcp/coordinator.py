@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .actions import Action
+from .registry import ActionRegistry, ActionRegistryError
 from .store import LeaseLostError, SagaStoreProtocol
 
 
@@ -88,7 +89,7 @@ class Coordinator:
     def __init__(
         self,
         store: SagaStoreProtocol,
-        actions: dict[str, Action],
+        actions: ActionRegistry | dict[str, Action],
         compensation_retries: int = 3,
         *,
         worker_id: str | None = None,
@@ -97,10 +98,38 @@ class Coordinator:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self.store = store
-        self.actions = actions
+        self._legacy_actions: dict[str, Action] | None = None
+        if isinstance(actions, ActionRegistry):
+            self.registry = actions
+            self.actions = {
+                item["id"]: self.registry.resolve(item["id"]).action
+                for item in self.registry.list_definitions()
+            }
+        else:
+            # Embedding compatibility: retain the caller's mutable dictionary by
+            # reference, as releases before 0.5 did. New/changed entries are
+            # synchronized into the runtime registry at the point of use.
+            self._legacy_actions = actions
+            self.registry = ActionRegistry(allow_legacy_recovery=True)
+            for name, action in actions.items():
+                self.registry.register_runtime(name, action)
+            self.actions = actions
         self.compensation_retries = compensation_retries
         self.worker_id = worker_id or f"worker:{uuid.uuid4()}"
         self.lease_seconds = lease_seconds
+
+    def _sync_legacy_action(self, action_name: str) -> None:
+        if self._legacy_actions is None:
+            return
+        action = self._legacy_actions.get(action_name)
+        if action is None:
+            return
+        try:
+            current = self.registry.resolve(action_name)
+        except ActionRegistryError:
+            current = None
+        if current is None or current.action is not action:
+            self.registry.register_runtime(action_name, action)
 
     def begin(
         self,
@@ -143,8 +172,12 @@ class Coordinator:
                 saga = self._require(saga_id, session_id)
                 if saga["status"] != "ACTIVE":
                     raise SagaError(f"Saga {saga_id} is {saga['status']}; steps require ACTIVE")
-                if action_name not in self.actions:
-                    raise SagaError(f"Unknown action: {action_name}")
+                self._sync_legacy_action(action_name)
+                try:
+                    registered = self.registry.prepare(action_name, values)
+                except ActionRegistryError as exc:
+                    raise SagaError(str(exc)) from exc
+                definition = registered.definition
                 assert lease.token is not None
                 step_id, timestamp = str(uuid.uuid4()), now()
                 self.store.create_step(
@@ -152,6 +185,9 @@ class Coordinator:
                         "id": step_id,
                         "saga_id": saga_id,
                         "action": action_name,
+                        "action_version": definition.version,
+                        "action_definition_hash": definition.hash,
+                        "action_definition": definition.snapshot(),
                         "input": values,
                         "status": "EXECUTING",
                         "result": None,
@@ -162,21 +198,26 @@ class Coordinator:
                     },
                     fence_token=lease.token,
                 )
+                result: Any = None
+                result_available = False
                 try:
                     lease.check()
-                    result = self.actions[action_name].execute(values, saga_id, step_id)
+                    result = registered.action.execute(values, saga_id, step_id)
+                    result_available = True
                     lease.check()
+                    self.registry.validate_output(definition, result)
                 except LeaseLostError:
                     raise
                 except Exception as exc:
                     lease.check()
-                    self.store.update_step(
-                        step_id,
-                        fence_token=lease.token,
-                        status="FAILED",
-                        error=str(exc),
-                        updated_at=now(),
-                    )
+                    changes: dict[str, Any] = {
+                        "status": "FAILED",
+                        "error": str(exc),
+                        "updated_at": now(),
+                    }
+                    if result_available:
+                        changes["result"] = result
+                    self.store.update_step(step_id, fence_token=lease.token, **changes)
                     self.store.update_saga(
                         saga_id,
                         fence_token=lease.token,
@@ -248,15 +289,25 @@ class Coordinator:
                 failures = []
                 for step in steps:
                     lease.check()
-                    action = self.actions.get(step["action"])
-                    if not action:
-                        failures.append(f"{step['id']}: action definition unavailable")
+                    self._sync_legacy_action(step["action"])
+                    try:
+                        registered = self.registry.resolve_for_step(step)
+                    except ActionRegistryError as exc:
+                        message = str(exc)
+                        failures.append(f"{step['id']}: {message}")
+                        self.store.update_step(
+                            step["id"],
+                            fence_token=lease.token,
+                            status="COMPENSATION_FAILED",
+                            error=message,
+                            updated_at=now(),
+                        )
                         continue
                     last_error = None
                     for attempt in range(self.compensation_retries):
                         try:
                             lease.check()
-                            action.compensate(step["input"], step["result"], saga_id, step["id"])
+                            registered.action.compensate(step["input"], step["result"], saga_id, step["id"])
                             lease.check()
                             self.store.update_step(
                                 step["id"],
@@ -299,6 +350,15 @@ class Coordinator:
         saga["steps"] = self.store.list_steps(saga_id)
         return saga
 
+    def list_actions(self) -> dict[str, Any]:
+        return {"actions": self.registry.list_definitions()}
+
+    def get_action(self, action_id: str, version: str | None = None) -> dict[str, Any]:
+        try:
+            return self.registry.get_definition(action_id, version)
+        except ActionRegistryError as exc:
+            raise SagaError(str(exc)) from exc
+
     def resume_pending_rollbacks(self, limit: int = 100) -> list[dict[str, Any]]:
         """Claim and resume recovery work without duplicate processing across workers."""
         results: list[dict[str, Any]] = []
@@ -307,8 +367,6 @@ class Coordinator:
             try:
                 results.append(self._rollback(saga_id, session_id=session_id, claimed_token=token))
             except SagaError:
-                # Lease loss or an operator-fixable rollback error remains durable
-                # and can be claimed by a later recovery pass.
                 continue
         return results
 

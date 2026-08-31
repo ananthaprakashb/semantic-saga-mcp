@@ -73,8 +73,6 @@ class JwtTokenVerifier(TokenVerifier):
         jwks_url: str,
         algorithms: Iterable[str] = ("RS256",),
     ) -> None:
-        # OAuth/OIDC issuer identifiers are exact values; a trailing slash can be
-        # significant, so never normalize what the operator configured.
         self.issuer = issuer
         self.audience = audience
         self.algorithms = tuple(algorithms)
@@ -135,7 +133,7 @@ class AuthorizationPolicy:
     execute_scope: str = "semantic-saga:execute"
     admin_scope: str = "semantic-saga:admin"
 
-    READ_TOOLS = frozenset({"get_saga"})
+    READ_TOOLS = frozenset({"get_saga", "list_actions", "get_action"})
     MUTATION_TOOLS = frozenset(
         {
             "begin_saga",

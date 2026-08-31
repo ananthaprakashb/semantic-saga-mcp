@@ -19,7 +19,16 @@ from semantic_saga_mcp.auth import (
 from semantic_saga_mcp.coordinator import Coordinator, SagaError
 from semantic_saga_mcp.execution import ExecutionContextResolver
 from semantic_saga_mcp.mcp_server import build_mcp_server
+from semantic_saga_mcp.registry import ActionRegistry
 from semantic_saga_mcp.store import SagaStore
+
+
+class RegistryRuntimeAction:
+    def execute(self, values, saga_id, step_id):
+        return {"ok": True}
+
+    def compensate(self, values, result, saga_id, step_id):
+        return None
 
 
 class ExecutionContextTests(unittest.TestCase):
@@ -150,8 +159,9 @@ class AuthorizationPolicyTests(unittest.TestCase):
     def setUp(self):
         self.policy = AuthorizationPolicy()
 
-    def test_viewer_is_read_only(self):
-        self.policy.authorize("get_saga", roles=["viewer"], scopes=[])
+    def test_viewer_is_read_only_and_can_inspect_action_registry(self):
+        for tool in ("get_saga", "list_actions", "get_action"):
+            self.policy.authorize(tool, roles=["viewer"], scopes=[])
         with self.assertRaises(AuthorizationError):
             self.policy.authorize("begin_saga", roles=["viewer"], scopes=[])
 
@@ -161,6 +171,7 @@ class AuthorizationPolicyTests(unittest.TestCase):
 
     def test_scopes_can_grant_service_principal_without_roles(self):
         self.policy.authorize("get_saga", roles=[], scopes=["semantic-saga:read"])
+        self.policy.authorize("list_actions", roles=[], scopes=["semantic-saga:read"])
         self.policy.authorize("begin_saga", roles=[], scopes=["semantic-saga:execute"])
 
 
@@ -203,6 +214,33 @@ class OfficialMcpV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fetched.structured_content["id"], saga_id)
             self.assertEqual(fetched.structured_content["status"], "ACTIVE")
 
+    async def test_action_registry_is_discoverable_through_mcp(self):
+        from mcp import Client
+
+        registry = ActionRegistry()
+        registry.register_runtime(
+            "demo",
+            RegistryRuntimeAction(),
+            version="2.1.0",
+            semantic={"domain": "demo", "operation": "write", "risk": "low"},
+            input_schema={"type": "object"},
+        )
+        coordinator = Coordinator(SagaStore(), registry)
+        server = build_mcp_server(
+            coordinator,
+            ExecutionContextResolver(local_owner_id="stdio:registry-client"),
+        )
+
+        async with Client(server) as client:
+            listed = await client.call_tool("list_actions", {})
+            self.assertFalse(listed.is_error)
+            self.assertEqual(listed.structured_content["actions"][0]["id"], "demo")
+            self.assertEqual(listed.structured_content["actions"][0]["version"], "2.1.0")
+            fetched = await client.call_tool("get_action", {"action": "demo", "version": "2.1.0"})
+            self.assertFalse(fetched.is_error)
+            self.assertEqual(fetched.structured_content["semantic"]["risk"], "low")
+            self.assertIn("definition_hash", fetched.structured_content)
+
     async def test_modern_tool_arguments_remain_strict(self):
         from mcp import Client
 
@@ -217,6 +255,10 @@ class OfficialMcpV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.is_error)
             self.assertIn("Invalid arguments", result.content[0].text)
             self.assertEqual(coordinator.store.pending_rollbacks(), [])
+
+            registry_result = await client.call_tool("list_actions", {"unexpected": True})
+            self.assertTrue(registry_result.is_error)
+            self.assertIn("Invalid arguments", registry_result.content[0].text)
 
 
 if __name__ == "__main__":
