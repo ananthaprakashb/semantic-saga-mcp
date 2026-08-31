@@ -23,6 +23,27 @@
       },
       "additionalProperties": false
     },
+    "retryPolicy": {
+      "type": "object",
+      "properties": {
+        "max_attempts": {"type": "integer", "minimum": 1},
+        "initial_backoff_seconds": {"type": "number", "minimum": 0},
+        "backoff_multiplier": {"type": "number", "minimum": 1},
+        "max_backoff_seconds": {"type": "number", "minimum": 0},
+        "jitter": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    },
+    "executionPolicy": {
+      "type": "object",
+      "properties": {
+        "forward": {"$ref": "#/$defs/retryPolicy"},
+        "compensation": {"$ref": "#/$defs/retryPolicy"},
+        "failure_mode": {"enum": ["rollback", "pause"]},
+        "approval_required": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
     "request": {
       "type": "object",
       "required": ["url"],
@@ -54,6 +75,7 @@
         "semantic": {"type": "object"},
         "input_schema": {"type": "object"},
         "output_schema": {"type": "object"},
+        "execution_policy": {"$ref": "#/$defs/executionPolicy"},
         "forward": {"$ref": "#/$defs/request"},
         "compensation": {"$ref": "#/$defs/request"}
       },
