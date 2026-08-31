@@ -12,8 +12,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 from . import __version__
-from .actions import Action, FileTransactionTool, load_actions
+from .actions import FileTransactionTool
 from .coordinator import Coordinator, SagaError
+from .registry import ActionRegistryError, load_action_registry
 from .store import PostgresSagaStore, SagaStore, SQLiteSagaStore
 
 
@@ -34,8 +35,26 @@ class ExecuteArguments(SagaArguments):
     input: dict[str, Any]
 
 
+class ListActionsArguments(StrictModel):
+    pass
+
+
+class GetActionArguments(StrictModel):
+    action: StrictStr = Field(min_length=1)
+    version: StrictStr | None = None
+
+
 class ToolCallParams(StrictModel):
-    name: Literal["begin_saga", "execute_saga_step", "commit_saga", "rollback_saga", "trigger_rollback", "get_saga"]
+    name: Literal[
+        "begin_saga",
+        "execute_saga_step",
+        "commit_saga",
+        "rollback_saga",
+        "trigger_rollback",
+        "get_saga",
+        "list_actions",
+        "get_action",
+    ]
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -58,19 +77,24 @@ ARGUMENT_MODELS = {
     "rollback_saga": SagaArguments,
     "trigger_rollback": SagaArguments,
     "get_saga": SagaArguments,
+    "list_actions": ListActionsArguments,
+    "get_action": GetActionArguments,
 }
 
 TOOLS = [
     {"name": "begin_saga", "description": "Start a durable transactional workflow.", "inputSchema": BeginArguments.model_json_schema()},
-    {"name": "execute_saga_step", "description": "Execute a configured action and durably register its compensation.", "inputSchema": ExecuteArguments.model_json_schema()},
+    {"name": "execute_saga_step", "description": "Execute the active immutable version of a registered action and durably snapshot its compensation contract.", "inputSchema": ExecuteArguments.model_json_schema()},
     {"name": "commit_saga", "description": "Commit a successfully completed saga; it can no longer be rolled back.", "inputSchema": SagaArguments.model_json_schema()},
-    {"name": "rollback_saga", "description": "Compensate saga steps in reverse order.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "rollback_saga", "description": "Compensate saga steps in reverse order using each step's persisted action definition.", "inputSchema": SagaArguments.model_json_schema()},
     {"name": "trigger_rollback", "description": "Immediately compensate saga steps in reverse order after an error.", "inputSchema": SagaArguments.model_json_schema()},
-    {"name": "get_saga", "description": "Inspect saga and step status, results, and rollback failures.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "get_saga", "description": "Inspect saga and step status, action versions, results, and rollback failures.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "list_actions", "description": "List active action contracts, versions, schemas, semantic effects, risk, and definition hashes.", "inputSchema": ListActionsArguments.model_json_schema()},
+    {"name": "get_action", "description": "Inspect one registered action contract by id and optional version.", "inputSchema": GetActionArguments.model_json_schema()},
 ]
 
 SYSTEM_PROMPT = (
     "When executing multi-step infrastructure changes, wrap your actions in the Saga Coordinator. "
+    "Use `list_actions` or `get_action` to inspect action schemas and semantic risk before execution. "
     "If you encounter an error, immediately call the `trigger_rollback` tool."
 )
 PROMPTS = [
@@ -106,7 +130,7 @@ class McpServer:
             elif request.method == "prompts/list":
                 result = {"prompts": PROMPTS}
             elif request.method == "prompts/get":
-                params = PromptGetParams.model_validate(request.params)
+                PromptGetParams.model_validate(request.params)
                 result = {
                     "description": PROMPTS[0]["description"],
                     "messages": [{"role": "user", "content": {"type": "text", "text": SYSTEM_PROMPT}}],
@@ -116,7 +140,7 @@ class McpServer:
             return {"jsonrpc": "2.0", "id": request.id, "result": result}
         except ValidationError as exc:
             return self._error(request_id, -32602, f"Invalid request: {exc}")
-        except (SagaError, KeyError, TypeError, ValueError) as exc:
+        except (SagaError, ActionRegistryError, KeyError, TypeError, ValueError) as exc:
             return self._error(request_id, -32602, str(exc))
         except Exception as exc:
             return self._error(request_id, -32603, f"Internal error: {exc}")
@@ -128,6 +152,10 @@ class McpServer:
             value = self.coordinator.begin(args.metadata, session_id=session_id)
         elif isinstance(args, ExecuteArguments):
             value = self.coordinator.execute(args.saga_id, args.action, args.input, session_id=session_id)
+        elif isinstance(args, ListActionsArguments):
+            value = self.coordinator.list_actions()
+        elif isinstance(args, GetActionArguments):
+            value = self.coordinator.get_action(args.action, args.version)
         elif params.name == "commit_saga":
             value = self.coordinator.commit(args.saga_id, session_id=session_id)
         elif params.name in {"rollback_saga", "trigger_rollback"}:
@@ -188,7 +216,8 @@ def _env_list(name: str) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Durable MCP saga coordinator")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--actions", default=os.getenv("SAGA_ACTIONS_FILE"), help="JSON action definitions")
+    parser.add_argument("--actions", default=os.getenv("SAGA_ACTIONS_FILE"), help="Versioned action registry JSON (legacy action maps remain readable)")
+    parser.add_argument("--allow-legacy-action-recovery", action="store_true", default=os.getenv("SAGA_ALLOW_LEGACY_ACTION_RECOVERY", "").lower() in {"1", "true", "yes"}, help="Explicitly allow pre-0.5 steps without immutable action snapshots to use the currently registered action")
     parser.add_argument("--file-root", default=os.getenv("SAGA_FILE_ROOT", "./saga-files"), help="Root directory for the built-in create_text_file action")
     parser.add_argument("--database", default=os.getenv("SAGA_DATABASE"), help="SQLite path for single-node durable storage")
     parser.add_argument("--postgres-dsn", default=os.getenv("SAGA_POSTGRES_DSN"), help="PostgreSQL DSN for horizontally scaled durable storage")
@@ -268,11 +297,44 @@ def main() -> None:
         store = SagaStore()
 
     logger = lambda message: print(message, file=sys.stderr, flush=True)
-    actions: dict[str, Action] = load_actions(args.actions, dry_run=args.dry_run, log=logger) if args.actions else {}
-    actions["create_text_file"] = FileTransactionTool(Path(args.file_root), logger)
+    registry = load_action_registry(
+        args.actions,
+        dry_run=args.dry_run,
+        log=logger,
+        allow_legacy_recovery=args.allow_legacy_action_recovery,
+    )
+    registry.register_runtime(
+        "create_text_file",
+        FileTransactionTool(Path(args.file_root), logger),
+        version="1.0.0",
+        semantic={
+            "domain": "filesystem",
+            "operation": "create",
+            "resource": "text_file",
+            "reversibility": "full",
+            "risk": "low",
+            "effects": {"creates": ["filesystem.text_file"]},
+        },
+        input_schema={
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "content": {"type": "string"},
+                "simulate_error": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "required": ["path"],
+            "properties": {"path": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    )
     coordinator = Coordinator(
         store,
-        actions,
+        registry,
         worker_id=args.worker_id,
         lease_seconds=args.lease_seconds,
     )
