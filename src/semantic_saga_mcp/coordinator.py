@@ -495,6 +495,16 @@ class Coordinator:
         except ActionRegistryError as exc:
             raise SagaError(str(exc)) from exc
 
+    @staticmethod
+    def _persisted_policy_for_node(node: dict[str, Any]) -> dict[str, Any] | None:
+        snapshot = node.get("action_definition")
+        if not isinstance(snapshot, dict):
+            return None
+        try:
+            return ActionDefinition.from_snapshot(snapshot).policy
+        except ActionRegistryError:
+            return None
+
     def run_ready_steps(
         self,
         saga_id: str,
@@ -546,7 +556,6 @@ class Coordinator:
                         else:
                             step_id = str(uuid.uuid4())
                             timestamp = now()
-                            definition = registered.definition
                             self.store.create_step(
                                 {
                                     "id": step_id,
@@ -580,7 +589,7 @@ class Coordinator:
                             for node, registered, step_id in prepared
                         }
                         for future in as_completed(futures):
-                            node, step_id = futures[future]
+                            node, _step_id = futures[future]
                             try:
                                 results[node["id"]] = future.result()
                             except LeaseLostError:
@@ -589,7 +598,7 @@ class Coordinator:
                                 results[node["id"]] = (False, None, str(exc), 1)
 
                     failures: list[dict[str, Any]] = []
-                    for node, registered, step_id in prepared:
+                    for node, _registered, step_id in prepared:
                         success, result, error, attempts = results[node["id"]]
                         node["attempts"] = int(node.get("attempts", 0)) + attempts
                         node["updated_at"] = now()
@@ -620,7 +629,10 @@ class Coordinator:
                     self._refresh_nodes(state)
                     self._save_engine(saga, state, lease.token)
                     if failures:
-                        rollback_after = any(self._registered_for_node(node).definition.policy["failure_mode"] == "rollback" for node in failures)
+                        rollback_after = any(
+                            (self._persisted_policy_for_node(node) or {"failure_mode": "pause"})["failure_mode"] == "rollback"
+                            for node in failures
+                        )
                         status = "FAILED" if rollback_after else "RECOVERY_REQUIRED"
                         message = "; ".join(f"{node['id']}: {node['error']}" for node in failures)
                         self.store.update_saga(saga_id, fence_token=lease.token, status=status, error=message, updated_at=now())
@@ -794,19 +806,21 @@ class Coordinator:
                 saga = self._require(saga_id, session_id)
                 metadata = saga.get("metadata") or {}
                 state = engine_state(metadata) if isinstance(metadata, dict) and "_engine" in metadata else None
-                pause_nodes = []
+                executing_nodes: list[dict[str, Any]] = []
                 if state is not None:
-                    for node in state["nodes"].values():
-                        if node.get("status") != "EXECUTING":
-                            continue
-                        try:
-                            registered = self._registered_for_node(node)
-                        except SagaError:
-                            continue
-                        if registered.definition.policy["failure_mode"] == "pause":
-                            pause_nodes.append(node)
-                if pause_nodes:
-                    for node in pause_nodes:
+                    executing_nodes = [node for node in state["nodes"].values() if node.get("status") == "EXECUTING"]
+
+                # A crash makes every in-flight node's remote outcome uncertain.
+                # If any member of the wave requires pause semantics—or if its
+                # persisted policy cannot be proven—do not auto-compensate only
+                # part of that wave. Escalate every in-flight node for operator
+                # reconciliation so no sibling is stranded as EXECUTING.
+                requires_operator = bool(executing_nodes) and any(
+                    (self._persisted_policy_for_node(node) or {"failure_mode": "pause"})["failure_mode"] == "pause"
+                    for node in executing_nodes
+                )
+                if requires_operator:
+                    for node in executing_nodes:
                         node["status"] = "FAILED"
                         node["error"] = "Worker restarted while external outcome was uncertain"
                         node["uncertain_outcome"] = True
