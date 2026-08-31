@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "actions": [
+    {
+      "id": "create_service_record",
+      "version": "1.0.0",
+      "kind": "http",
+      "active": true,
+      "semantic": {
+        "domain": "service_management",
+        "operation": "create",
+        "resource": "service_record",
+        "reversibility": "full",
+        "risk": "medium",
+        "effects": {
+          "creates": ["service_management.service_record"]
+        },
+        "compensation_guarantee": "delete-created-resource"
+      },
+      "input_schema": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": true
+      },
+      "forward": {
+        "url": "https://api.example.com/services",
+        "method": "POST",
+        "headers": {
+          "Authorization": {
+            "secret_ref": "env://SEMANTIC_SAGA_DEMO_TOKEN",
+            "prefix": "Bearer "
+          }
+        },
+        "body": {"name": "${input.name}"},
+        "timeout_seconds": 15
+      },
+      "compensation": {
+        "url": "https://api.example.com/services/${result.id}",
+        "method": "DELETE",
+        "headers": {
+          "Authorization": {
+            "secret_ref": "env://SEMANTIC_SAGA_DEMO_TOKEN",
+            "prefix": "Bearer "
+          }
+        },
+        "timeout_seconds": 15
+      }
+    }
+  ]
+}
