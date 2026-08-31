@@ -25,6 +25,18 @@ def saga_record(status: str = "ACTIVE"):
     }
 
 
+def action_snapshot():
+    return {
+        "id": "test",
+        "version": "1.2.3",
+        "kind": "http",
+        "semantic": {"domain": "test", "risk": "low"},
+        "input_schema": {"type": "object"},
+        "forward": {"url": "https://example.test/do"},
+        "compensation": {"url": "https://example.test/undo"},
+    }
+
+
 @unittest.skipUnless(DSN, "SAGA_TEST_POSTGRES_DSN is not configured")
 class PostgresSagaStoreTests(unittest.TestCase):
     @classmethod
@@ -48,6 +60,41 @@ class PostgresSagaStoreTests(unittest.TestCase):
         self.assertEqual(loaded["tenant_id"], "acme")
         self.assertEqual(loaded["creator_principal_id"], "alice")
 
+    def test_action_contract_fields_round_trip_as_first_class_step_data(self):
+        record = saga_record()
+        self.store.create_saga(record)
+        token = self.store.acquire_saga_lease(record["id"], record["session_id"], "worker-a", 10.0)
+        snapshot = action_snapshot()
+        stored = self.store.create_step(
+            {
+                "id": str(uuid.uuid4()),
+                "saga_id": record["id"],
+                "action": "test",
+                "action_version": "1.2.3",
+                "action_definition_hash": "a" * 64,
+                "action_definition": snapshot,
+                "input": {"number": 1},
+                "status": "EXECUTING",
+                "result": None,
+                "error": None,
+                "compensation_attempts": 0,
+                "created_at": record["created_at"],
+                "updated_at": record["updated_at"],
+            },
+            fence_token=token,
+        )
+        self.assertEqual(stored["action_version"], "1.2.3")
+        self.assertEqual(stored["action_definition_hash"], "a" * 64)
+        self.assertEqual(stored["action_definition"], snapshot)
+
+        restarted = PostgresSagaStore(DSN, min_pool_size=1, max_pool_size=2)
+        try:
+            loaded = restarted.get_step(stored["id"])
+            self.assertEqual(loaded["action_definition"], snapshot)
+            self.assertEqual(loaded["action_version"], "1.2.3")
+        finally:
+            restarted.close()
+
     def test_step_sequence_allocation_is_atomic_under_concurrency(self):
         record = saga_record()
         self.store.create_saga(record)
@@ -62,6 +109,9 @@ class PostgresSagaStoreTests(unittest.TestCase):
                     "id": str(uuid.uuid4()),
                     "saga_id": record["id"],
                     "action": "test",
+                    "action_version": "1.2.3",
+                    "action_definition_hash": "a" * 64,
+                    "action_definition": action_snapshot(),
                     "input": {"number": number},
                     "status": "EXECUTING",
                     "result": None,
