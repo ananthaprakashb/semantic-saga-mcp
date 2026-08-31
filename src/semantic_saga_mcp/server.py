@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 from . import __version__
 from .actions import FileTransactionTool
 from .coordinator import Coordinator, SagaError
+from .instrumented_coordinator import InstrumentedCoordinator
+from .observability import configure_telemetry
 from .registry import ActionRegistryError, load_action_registry
 from .store import PostgresSagaStore, SagaStore, SQLiteSagaStore
 
@@ -62,6 +64,15 @@ class CheckpointArguments(SagaArguments):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
+class AuditArguments(SagaArguments):
+    limit: int = Field(default=500, ge=1, le=5000)
+    event_types: list[StrictStr] = Field(default_factory=list)
+
+
+class TimelineArguments(SagaArguments):
+    limit: int = Field(default=1000, ge=1, le=5000)
+
+
 class ListActionsArguments(StrictModel):
     pass
 
@@ -84,6 +95,9 @@ class ToolCallParams(StrictModel):
         "rollback_saga",
         "trigger_rollback",
         "get_saga",
+        "get_saga_timeline",
+        "get_audit_events",
+        "verify_audit_chain",
         "list_actions",
         "get_action",
     ]
@@ -114,6 +128,9 @@ ARGUMENT_MODELS = {
     "rollback_saga": SagaArguments,
     "trigger_rollback": SagaArguments,
     "get_saga": SagaArguments,
+    "get_saga_timeline": TimelineArguments,
+    "get_audit_events": AuditArguments,
+    "verify_audit_chain": AuditArguments,
     "list_actions": ListActionsArguments,
     "get_action": GetActionArguments,
 }
@@ -130,6 +147,9 @@ TOOLS = [
     {"name": "rollback_saga", "description": "Compensate saga steps in reverse order using each step's persisted action definition and compensation retry policy.", "inputSchema": SagaArguments.model_json_schema()},
     {"name": "trigger_rollback", "description": "Immediately compensate saga steps in reverse order after an error.", "inputSchema": SagaArguments.model_json_schema()},
     {"name": "get_saga", "description": "Inspect saga, workflow DAG, checkpoints, action versions, results, approvals, and recovery state.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "get_saga_timeline", "description": "Inspect a payload-safe execution timeline combining step summaries, workflow nodes, hash-chained audit events, and audit integrity.", "inputSchema": TimelineArguments.model_json_schema()},
+    {"name": "get_audit_events", "description": "Read append-only audit events for a saga without exposing action inputs, results, or secret material.", "inputSchema": AuditArguments.model_json_schema()},
+    {"name": "verify_audit_chain", "description": "Verify the per-saga SHA-256 audit hash chain and return its current head hash.", "inputSchema": AuditArguments.model_json_schema()},
     {"name": "list_actions", "description": "List active action contracts, schemas, semantic effects, risk, hashes, and resolved execution policies.", "inputSchema": ListActionsArguments.model_json_schema()},
     {"name": "get_action", "description": "Inspect one registered action contract by id and optional version.", "inputSchema": GetActionArguments.model_json_schema()},
 ]
@@ -138,7 +158,8 @@ SYSTEM_PROMPT = (
     "Wrap multi-step side effects in the Saga Coordinator. Inspect actions with `list_actions` or `get_action`. "
     "For orchestrated work, use `plan_saga_step` with dependencies, obtain approvals when required, then call "
     "`run_ready_steps`. Use checkpoints for durable milestones. If a saga enters RECOVERY_REQUIRED, reconcile the "
-    "external outcome before forcing a retry; otherwise roll back."
+    "external outcome before forcing a retry; otherwise roll back. Use `get_saga_timeline` and `verify_audit_chain` "
+    "when diagnosing or reviewing execution history."
 )
 PROMPTS = [
     {
@@ -212,6 +233,16 @@ class McpServer:
             value = self.coordinator.retry_step(args.saga_id, args.node_id, session_id=session_id, force=args.force)
         elif isinstance(args, CheckpointArguments):
             value = self.coordinator.checkpoint(args.saga_id, args.name, args.data, session_id=session_id)
+        elif isinstance(args, AuditArguments):
+            if params.name == "verify_audit_chain":
+                value = self.coordinator.verify_audit_chain(args.saga_id, session_id=session_id)  # type: ignore[attr-defined]
+            else:
+                value = self.coordinator.get_audit_events(  # type: ignore[attr-defined]
+                    args.saga_id, session_id=session_id, limit=args.limit,
+                    event_types=set(args.event_types) if args.event_types else None,
+                )
+        elif isinstance(args, TimelineArguments):
+            value = self.coordinator.get_timeline(args.saga_id, session_id=session_id, limit=args.limit)  # type: ignore[attr-defined]
         elif isinstance(args, ListActionsArguments):
             value = self.coordinator.list_actions()
         elif isinstance(args, GetActionArguments):
@@ -305,6 +336,10 @@ def main() -> None:
     parser.add_argument("--auth-principal-type-claim", default=os.getenv("SAGA_AUTH_PRINCIPAL_TYPE_CLAIM", "principal_type"), help="Token claim identifying user/service principal type")
     parser.add_argument("--auth-allow-missing-tenant", action="store_true", default=os.getenv("SAGA_AUTH_ALLOW_MISSING_TENANT", "").lower() in {"1", "true", "yes"}, help="Use tenant 'default' when an authenticated token has no configured tenant claim")
 
+    parser.add_argument("--otel-endpoint", default=os.getenv("SAGA_OTEL_ENDPOINT"), help="OTLP/HTTP collector base endpoint; also honors OTEL_EXPORTER_OTLP_ENDPOINT")
+    parser.add_argument("--otel-headers", default=os.getenv("SAGA_OTEL_HEADERS"), help="Optional OTLP exporter headers string")
+    parser.add_argument("--otel-service-name", default=os.getenv("SAGA_OTEL_SERVICE_NAME", "semantic-saga-mcp"), help="OpenTelemetry service.name")
+
     parser.add_argument("--trust-identity-headers", action="store_true", default=os.getenv("SAGA_TRUST_IDENTITY_HEADERS", "").lower() in {"1", "true", "yes"}, help="Migration mode: trust identity headers from an authenticated reverse proxy")
     parser.add_argument("--allow-unauthenticated-http", action="store_true", default=os.getenv("SAGA_ALLOW_UNAUTHENTICATED_HTTP", "").lower() in {"1", "true", "yes"}, help="Allow non-local Streamable HTTP without native/proxy identity; private-network migration only")
     parser.add_argument("--dry-run", action="store_true", default=os.getenv("SAGA_DRY_RUN", "").lower() in {"1", "true", "yes"}, help="Preview actions, simulate failure, and log compensation without API calls")
@@ -352,6 +387,15 @@ def main() -> None:
     else:
         store = SagaStore()
 
+    try:
+        telemetry = configure_telemetry(
+            service_name=args.otel_service_name,
+            endpoint=args.otel_endpoint,
+            headers=args.otel_headers,
+        )
+    except RuntimeError as exc:
+        parser.error(str(exc))
+
     logger = lambda message: print(message, file=sys.stderr, flush=True)
     registry = load_action_registry(
         args.actions,
@@ -388,7 +432,13 @@ def main() -> None:
             "additionalProperties": False,
         },
     )
-    coordinator = Coordinator(store, registry, worker_id=args.worker_id, lease_seconds=args.lease_seconds)
+    coordinator = InstrumentedCoordinator(
+        store,
+        registry,
+        worker_id=args.worker_id,
+        lease_seconds=args.lease_seconds,
+        telemetry=telemetry,
+    )
     recovered = coordinator.resume_pending_rollbacks(limit=args.recovery_limit)
     if recovered:
         logger(f"[recovery] worker {coordinator.worker_id} recovered {len(recovered)} saga(s)")
