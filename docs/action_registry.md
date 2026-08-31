@@ -1,90 +1,61 @@
 # Enterprise Action Registry
 
-Semantic Saga 0.5 treats every side-effecting action as a versioned contract. The contract is selected by the server operator, validated before execution, and snapshotted into the saga journal before the external side effect begins.
+Semantic Saga 0.6 treats every side-effecting action as a versioned contract. The contract is selected by the server operator, validated before execution, and snapshotted into the saga journal before the external side effect begins. Phase 5 adds optional versioned execution policy for retry, approval, and failure handling.
 
 ## Why versioned actions matter
 
-A saga may be recovered hours or days after the original process disappears. If an operator changes an action's rollback URL or semantics in the meantime, using the new definition to compensate an old step can damage a different resource or violate the original workflow contract.
+A saga may be recovered hours or days after the original process disappears. If an operator changes an action's rollback URL, retry contract, approval requirement, or semantics in the meantime, using the new definition to recover an old step can violate the original workflow contract.
 
-For every new step Semantic Saga therefore persists:
-
-- `action` — stable action id;
-- `action_version` — operator-assigned immutable version;
-- `action_definition_hash` — SHA-256 of the canonical definition snapshot; and
-- `action_definition` — the exact non-secret contract used by the step.
-
-The snapshot is written while the step is still `EXECUTING`, before the forward request is sent.
+For every new concrete step Semantic Saga therefore persists `action`, `action_version`, `action_definition_hash`, and the exact non-secret `action_definition`. The snapshot is written while the step is still `EXECUTING`, before the forward request is sent.
 
 ## Registry format
 
-Use `schema_version: 1` and an `actions` array. Each HTTP action declares one active immutable version, semantic metadata, input/output JSON Schemas, and forward/compensation requests.
+Use `schema_version: 1` and an `actions` array. Each HTTP action declares one active immutable version, semantic metadata, input/output JSON Schemas, optional execution policy, and forward/compensation requests.
+
+See `examples/action_registry.json` and `docs/action_registry.schema.json` for a complete example.
+
+## Execution policy
+
+An action may include:
 
 ```json
 {
-  "schema_version": 1,
-  "actions": [
-    {
-      "id": "create_repository",
-      "version": "1.0.0",
-      "kind": "http",
-      "active": true,
-      "semantic": {
-        "domain": "source_control",
-        "operation": "create",
-        "resource": "repository",
-        "reversibility": "full",
-        "risk": "medium",
-        "effects": {"creates": ["source_control.repository"]}
-      },
-      "input_schema": {
-        "type": "object",
-        "required": ["name"],
-        "properties": {"name": {"type": "string", "minLength": 1}},
-        "additionalProperties": false
-      },
-      "output_schema": {
-        "type": "object",
-        "required": ["id"],
-        "properties": {"id": {"type": "string"}}
-      },
-      "forward": {
-        "url": "https://scm.internal/repos",
-        "method": "POST",
-        "headers": {
-          "Authorization": {
-            "secret_ref": "env://SCM_SERVICE_TOKEN",
-            "prefix": "Bearer "
-          }
-        },
-        "body": {"name": "${input.name}"}
-      },
-      "compensation": {
-        "url": "https://scm.internal/repos/delete",
-        "method": "POST",
-        "headers": {
-          "Authorization": {
-            "secret_ref": "env://SCM_SERVICE_TOKEN",
-            "prefix": "Bearer "
-          }
-        },
-        "body": {"id": "${result.id}"}
-      }
-    }
-  ]
+  "execution_policy": {
+    "forward": {
+      "max_attempts": 3,
+      "initial_backoff_seconds": 0.5,
+      "backoff_multiplier": 2,
+      "max_backoff_seconds": 5,
+      "jitter": 0.2
+    },
+    "compensation": {
+      "max_attempts": 5,
+      "initial_backoff_seconds": 1,
+      "backoff_multiplier": 2,
+      "max_backoff_seconds": 15,
+      "jitter": 0.2
+    },
+    "failure_mode": "pause",
+    "approval_required": true
+  }
 }
 ```
 
-See `examples/action_registry.json` and `docs/action_registry.schema.json`.
+`failure_mode` is either `rollback` or `pause`. `rollback` preserves classic Saga behavior. `pause` moves an exhausted planned workflow into `RECOVERY_REQUIRED` so an operator can reconcile, retry, or roll back.
+
+Forward retries reuse the same persisted step id and therefore the same `Idempotency-Key`. Jitter is deterministic and hash-derived. Remote endpoints still need to honor idempotency because a timeout can leave the caller uncertain about whether the remote side effect happened.
+
+Default behavior remains compatible with 0.5: one forward attempt, the coordinator's existing compensation retry count, automatic rollback, and no approval gate. If `execution_policy` is omitted, those defaults are resolved at runtime and are not inserted into the immutable action snapshot. This preserves Phase 4 hashes for existing definitions.
 
 ## Immutable versions
 
-Within one registry process, the same `id` + `version` cannot be registered with different content. Change the version whenever any behavior relevant to execution or compensation changes, including URL, method, body template, schema, semantic metadata, or built-in implementation.
+Within one registry process, the same `id` + `version` cannot be registered with different content. Change the version whenever behavior relevant to execution or compensation changes, including URL, method, body template, schema, semantic metadata, execution policy, or built-in implementation.
 
 Only one version of an action can be `active: true`. Older versions can remain in the manifest with `active: false` for inspection. Historical HTTP recovery does not require an old version to remain active—or even present in the current manifest—because the exact HTTP contract is reconstructed from the persisted step snapshot.
 
 ## Runtime and built-in actions
 
-Python/runtime actions cannot be safely reconstructed from a JSON snapshot alone. Semantic Saga stores the implementation identity and a source hash. Recovery requires the currently registered runtime action to have the same id, version, and definition hash. If code changed without a version bump, compensation fails closed with `ROLLBACK_FAILED` instead of invoking changed logic.
+Python/runtime actions cannot be safely reconstructed from JSON alone. Semantic Saga stores the implementation identity and a source hash. Recovery requires the currently registered runtime action to have the same id, version, and definition hash. If code changed without a version bump, compensation fails closed with `ROLLBACK_FAILED` instead of invoking changed logic.
 
 When changing `create_text_file` or any future built-in action, bump its registered action version.
 
@@ -92,7 +63,7 @@ When changing `create_text_file` or any future built-in action, bump its registe
 
 Input schemas are checked before a step is created or any external side effect occurs. Invalid input leaves the saga `ACTIVE` and creates no step.
 
-Output schemas are checked after the action returns. Because the remote side effect may already have happened, an invalid output is treated as a workflow failure: the returned receipt is journaled on the failed step and rollback is attempted using that receipt.
+Output schemas are checked after the action returns. Because the remote side effect may already have happened, an invalid output is treated as a workflow failure: the returned receipt is journaled on the failed step and rollback or pause policy is applied using that receipt.
 
 ## Secret references
 
@@ -113,35 +84,16 @@ The Python `SecretProvider` protocol is intentionally small so deployments can a
 
 ## Historical recovery behavior
 
-HTTP step:
+For HTTP steps Semantic Saga verifies the stored hash and identity, reconstructs the exact historical HTTP contract, resolves current secret material, and invokes compensation using the original step's stable rollback idempotency key.
 
-1. verify the persisted definition hash;
-2. verify action id/version match the snapshot;
-3. reconstruct the HTTP compensation from that exact snapshot;
-4. resolve current secret material through the referenced secret provider; and
-5. invoke compensation using the original step's stable rollback idempotency key.
-
-Runtime step:
-
-1. verify the persisted definition hash;
-2. locate the exact registered runtime version; and
-3. require its implementation definition hash to match before compensation.
-
-Any mismatch is surfaced as `COMPENSATION_FAILED` / `ROLLBACK_FAILED`.
+For runtime steps it verifies the persisted hash, locates the exact registered runtime version, and requires the implementation definition hash to match before compensation. Any mismatch is surfaced as `COMPENSATION_FAILED` / `ROLLBACK_FAILED`.
 
 ## Upgrading journals from before 0.5
 
 Steps created by releases before 0.5 do not contain immutable action snapshots. Semantic Saga refuses to compensate these rows by default because it cannot prove that the currently configured action has the same semantics as the historical action.
 
-Preferred migration path: recover or complete pending pre-0.5 sagas with the pre-upgrade release, then deploy 0.5.
-
-If an operator has independently verified that the currently configured actions are identical to the historical definitions, `--allow-legacy-action-recovery` (or `SAGA_ALLOW_LEGACY_ACTION_RECOVERY=true`) explicitly opts into the old behavior. This is a migration escape hatch, not the recommended steady state.
+Preferred migration path: recover or complete pending pre-0.5 sagas with the pre-upgrade release, then upgrade. If an operator has independently verified that the currently configured actions are identical to the historical definitions, `--allow-legacy-action-recovery` (or `SAGA_ALLOW_LEGACY_ACTION_RECOVERY=true`) explicitly opts into the old behavior.
 
 ## MCP discovery
 
-Authenticated read-capable principals can call:
-
-- `list_actions` — active ids, versions, hashes, schemas, and semantic metadata;
-- `get_action` — one action id and optional version.
-
-These tools do not resolve or expose secret values. `viewer`, `operator`, `admin`, `semantic-saga:read`, and broader execute/admin scopes can inspect the registry according to the existing authorization model.
+Authenticated read-capable principals can call `list_actions` and `get_action`. The discovery result includes the resolved execution policy but never resolves or exposes secret values. `viewer`, `operator`, `admin`, `semantic-saga:read`, and broader execute/admin scopes can inspect the registry according to the existing authorization model.
