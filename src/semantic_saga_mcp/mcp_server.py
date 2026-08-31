@@ -24,9 +24,11 @@ from . import __version__
 from .auth import AuthorizationError, AuthorizationPolicy, IdentityError
 from .coordinator import Coordinator, SagaError
 from .execution import ExecutionContextResolver
+from .observability import Telemetry, actor_scope, attach_mcp_trace
 from .server import (
     ARGUMENT_MODELS,
     ApprovalArguments,
+    AuditArguments,
     BeginArguments,
     CheckpointArguments,
     ExecuteArguments,
@@ -36,6 +38,7 @@ from .server import (
     RetryStepArguments,
     RunReadyArguments,
     SYSTEM_PROMPT,
+    TimelineArguments,
     TOOLS,
 )
 
@@ -68,6 +71,7 @@ def build_mcp_server(
     policy: AuthorizationPolicy | None = None,
 ) -> Server:
     policy = policy or AuthorizationPolicy()
+    telemetry = getattr(coordinator, "telemetry", Telemetry())
     tools = [
         Tool(
             name=definition["name"],
@@ -84,87 +88,115 @@ def build_mcp_server(
         model = ARGUMENT_MODELS.get(params.name)
         if model is None:
             return _tool_error(f"Unknown action tool: {params.name}")
-        try:
-            args = model.model_validate(params.arguments or {})
-            execution = resolver.resolve(ctx)
-            policy.authorize(params.name, roles=execution.roles, scopes=execution.scopes)
+        request = getattr(ctx, "request", None)
+        headers = getattr(request, "headers", None)
+        meta = getattr(ctx, "meta", None)
+        with attach_mcp_trace(meta if isinstance(meta, dict) else None, headers):
+            with telemetry.span(
+                "mcp.tools.call",
+                {
+                    "rpc.system": "mcp",
+                    "rpc.method": "tools/call",
+                    "mcp.tool.name": params.name,
+                },
+            ):
+                try:
+                    args = model.model_validate(params.arguments or {})
+                    execution = resolver.resolve(ctx)
+                    policy.authorize(params.name, roles=execution.roles, scopes=execution.scopes)
 
-            def invoke() -> dict[str, Any]:
-                if isinstance(args, BeginArguments):
-                    metadata = dict(args.metadata)
-                    metadata["_identity"] = execution.audit_metadata()
-                    return coordinator.begin(
-                        metadata,
-                        session_id=execution.owner_id,
-                        tenant_id=execution.tenant_id,
-                        principal_id=execution.principal_id,
-                    )
-                if isinstance(args, PlanStepArguments):
-                    return coordinator.plan_step(
-                        args.saga_id,
-                        args.action,
-                        args.input,
-                        session_id=execution.owner_id,
-                        key=args.key,
-                        depends_on=list(args.depends_on),
-                        approval_required=args.approval_required,
-                    )
-                if isinstance(args, ExecuteArguments):
-                    return coordinator.execute(
-                        args.saga_id,
-                        args.action,
-                        args.input,
-                        session_id=execution.owner_id,
-                    )
-                if isinstance(args, RunReadyArguments):
-                    return coordinator.run_ready_steps(
-                        args.saga_id,
-                        session_id=execution.owner_id,
-                        max_parallel=args.max_parallel,
-                        max_steps=args.max_steps,
-                    )
-                if isinstance(args, ApprovalArguments):
-                    return coordinator.approve_step(
-                        args.saga_id,
-                        args.node_id,
-                        session_id=execution.owner_id,
-                        approved=args.approved,
-                        reason=args.reason,
-                        principal_id=execution.principal_id,
-                    )
-                if isinstance(args, RetryStepArguments):
-                    return coordinator.retry_step(
-                        args.saga_id,
-                        args.node_id,
-                        session_id=execution.owner_id,
-                        force=args.force,
-                    )
-                if isinstance(args, CheckpointArguments):
-                    return coordinator.checkpoint(
-                        args.saga_id,
-                        args.name,
-                        args.data,
-                        session_id=execution.owner_id,
-                        principal_id=execution.principal_id,
-                    )
-                if isinstance(args, ListActionsArguments):
-                    return coordinator.list_actions()
-                if isinstance(args, GetActionArguments):
-                    return coordinator.get_action(args.action, args.version)
-                if params.name == "commit_saga":
-                    return coordinator.commit(args.saga_id, session_id=execution.owner_id)
-                if params.name in {"rollback_saga", "trigger_rollback"}:
-                    return coordinator.rollback(args.saga_id, session_id=execution.owner_id)
-                return coordinator.get(args.saga_id, session_id=execution.owner_id)
+                    def invoke() -> dict[str, Any]:
+                        with actor_scope(execution.principal_id, execution.principal_type):
+                            if isinstance(args, BeginArguments):
+                                metadata = dict(args.metadata)
+                                metadata["_identity"] = execution.audit_metadata()
+                                return coordinator.begin(
+                                    metadata,
+                                    session_id=execution.owner_id,
+                                    tenant_id=execution.tenant_id,
+                                    principal_id=execution.principal_id,
+                                )
+                            if isinstance(args, PlanStepArguments):
+                                return coordinator.plan_step(
+                                    args.saga_id,
+                                    args.action,
+                                    args.input,
+                                    session_id=execution.owner_id,
+                                    key=args.key,
+                                    depends_on=list(args.depends_on),
+                                    approval_required=args.approval_required,
+                                )
+                            if isinstance(args, ExecuteArguments):
+                                return coordinator.execute(
+                                    args.saga_id,
+                                    args.action,
+                                    args.input,
+                                    session_id=execution.owner_id,
+                                )
+                            if isinstance(args, RunReadyArguments):
+                                return coordinator.run_ready_steps(
+                                    args.saga_id,
+                                    session_id=execution.owner_id,
+                                    max_parallel=args.max_parallel,
+                                    max_steps=args.max_steps,
+                                )
+                            if isinstance(args, ApprovalArguments):
+                                return coordinator.approve_step(
+                                    args.saga_id,
+                                    args.node_id,
+                                    session_id=execution.owner_id,
+                                    approved=args.approved,
+                                    reason=args.reason,
+                                    principal_id=execution.principal_id,
+                                )
+                            if isinstance(args, RetryStepArguments):
+                                return coordinator.retry_step(
+                                    args.saga_id,
+                                    args.node_id,
+                                    session_id=execution.owner_id,
+                                    force=args.force,
+                                )
+                            if isinstance(args, CheckpointArguments):
+                                return coordinator.checkpoint(
+                                    args.saga_id,
+                                    args.name,
+                                    args.data,
+                                    session_id=execution.owner_id,
+                                    principal_id=execution.principal_id,
+                                )
+                            if isinstance(args, AuditArguments):
+                                if params.name == "verify_audit_chain":
+                                    return coordinator.verify_audit_chain(args.saga_id, session_id=execution.owner_id)
+                                return coordinator.get_audit_events(
+                                    args.saga_id,
+                                    session_id=execution.owner_id,
+                                    limit=args.limit,
+                                    event_types=set(args.event_types) if args.event_types else None,
+                                )
+                            if isinstance(args, TimelineArguments):
+                                return coordinator.get_timeline(
+                                    args.saga_id,
+                                    session_id=execution.owner_id,
+                                    limit=args.limit,
+                                )
+                            if isinstance(args, ListActionsArguments):
+                                return coordinator.list_actions()
+                            if isinstance(args, GetActionArguments):
+                                return coordinator.get_action(args.action, args.version)
+                            if params.name == "commit_saga":
+                                return coordinator.commit(args.saga_id, session_id=execution.owner_id)
+                            if params.name in {"rollback_saga", "trigger_rollback"}:
+                                return coordinator.rollback(args.saga_id, session_id=execution.owner_id)
+                            return coordinator.get(args.saga_id, session_id=execution.owner_id)
 
-            value = await anyio.to_thread.run_sync(invoke)
-            return _tool_result(value)
-        except ValidationError as exc:
-            return _tool_error(f"Invalid arguments: {exc}")
-        except (IdentityError, AuthorizationError, SagaError, KeyError, TypeError, ValueError) as exc:
-            return _tool_error(str(exc))
-        except Exception as exc:
-            return _tool_error(f"Internal error: {exc}")
+                    value = await anyio.to_thread.run_sync(invoke)
+                    return _tool_result(value)
+                except ValidationError as exc:
+                    return _tool_error(f"Invalid arguments: {exc}")
+                except (IdentityError, AuthorizationError, SagaError, KeyError, TypeError, ValueError) as exc:
+                    return _tool_error(str(exc))
+                except Exception as exc:
+                    return _tool_error(f"Internal error: {exc}")
 
     async def list_prompts(_: ServerRequestContext, __: Any) -> ListPromptsResult:
         return ListPromptsResult(prompts=[PROMPT])
