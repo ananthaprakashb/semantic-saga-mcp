@@ -16,13 +16,7 @@ class LeaseLostError(RuntimeError):
 
 @runtime_checkable
 class SagaStoreProtocol(Protocol):
-    """Storage contract for durable and distributed saga state.
-
-    A horizontally scaled adapter must atomically allocate per-saga step
-    sequences, lease recovery work to one worker, and reject writes carrying a
-    stale fencing token. SQLite and the in-memory store implement the same
-    contract so coordinator behavior remains identical in local development.
-    """
+    """Storage contract for durable and distributed saga state."""
 
     def create_saga(self, saga: dict[str, Any]) -> None: ...
     def get_saga(self, saga_id: str, session_id: str) -> dict[str, Any] | None: ...
@@ -155,6 +149,8 @@ class SagaStore:
 class SQLiteSagaStore:
     """Durable single-node SQLite implementation of :class:`SagaStoreProtocol`."""
 
+    _JSON_FIELDS = {"metadata", "input", "result", "action_definition"}
+
     def __init__(self, path: str) -> None:
         Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(path, check_same_thread=False)
@@ -182,6 +178,9 @@ class SQLiteSagaStore:
                 saga_id TEXT NOT NULL,
                 sequence INTEGER NOT NULL,
                 action TEXT NOT NULL,
+                action_version TEXT,
+                action_definition_hash TEXT,
+                action_definition TEXT,
                 input TEXT NOT NULL,
                 status TEXT NOT NULL,
                 result TEXT,
@@ -201,8 +200,12 @@ class SQLiteSagaStore:
         self._ensure_column("sagas", "lease_until", "REAL")
         self._ensure_column("sagas", "fence_token", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("steps", "fence_token", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("steps", "action_version", "TEXT")
+        self._ensure_column("steps", "action_definition_hash", "TEXT")
+        self._ensure_column("steps", "action_definition", "TEXT")
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_sagas_session ON sagas(session_id, id)")
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_sagas_recovery ON sagas(status, lease_until)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_steps_action_version ON steps(action, action_version)")
         self._db.execute(
             """UPDATE sagas SET next_sequence=COALESCE(
                 (SELECT MAX(sequence) + 1 FROM steps WHERE steps.saga_id=sagas.id), 1
@@ -217,12 +220,12 @@ class SQLiteSagaStore:
         if column not in columns:
             self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
-    @staticmethod
-    def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    @classmethod
+    def _decode(cls, row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
             return None
         value = dict(row)
-        for key in ("metadata", "input", "result"):
+        for key in cls._JSON_FIELDS:
             if key in value and value[key] is not None:
                 value[key] = json.loads(value[key])
         for internal in ("next_sequence", "lease_owner", "lease_until", "fence_token"):
@@ -273,10 +276,13 @@ class SQLiteSagaStore:
                 self._db.execute("UPDATE sagas SET next_sequence=next_sequence+1 WHERE id=?", (step["saga_id"],))
                 self._db.execute(
                     """INSERT INTO steps
-                    (id,saga_id,sequence,action,input,status,result,error,compensation_attempts,created_at,updated_at,fence_token)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (id,saga_id,sequence,action,action_version,action_definition_hash,action_definition,input,status,result,error,compensation_attempts,created_at,updated_at,fence_token)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        step["id"], step["saga_id"], sequence, step["action"], json.dumps(step["input"]), step["status"],
+                        step["id"], step["saga_id"], sequence, step["action"], step.get("action_version"),
+                        step.get("action_definition_hash"),
+                        json.dumps(step.get("action_definition")) if step.get("action_definition") is not None else None,
+                        json.dumps(step["input"]), step["status"],
                         json.dumps(step.get("result")) if step.get("result") is not None else None, step.get("error"),
                         step.get("compensation_attempts", 0), step["created_at"], step["updated_at"], fence_token or 0,
                     ),
@@ -400,7 +406,7 @@ class SQLiteSagaStore:
         if not changes:
             return
         encoded = {
-            key: json.dumps(value) if key in {"metadata", "input", "result"} and value is not None else value
+            key: json.dumps(value) if key in self._JSON_FIELDS and value is not None else value
             for key, value in changes.items()
         }
         assignments = ", ".join(f"{key}=?" for key in encoded)
@@ -417,10 +423,9 @@ class PostgresSagaStore:
         try:
             from psycopg.rows import dict_row
             from psycopg_pool import ConnectionPool
-        except ImportError as exc:  # pragma: no cover - dependency is packaged, defensive only
+        except ImportError as exc:  # pragma: no cover
             raise RuntimeError("PostgreSQL support requires psycopg and psycopg-pool") from exc
 
-        self._dict_row = dict_row
         self._pool = ConnectionPool(
             conninfo=dsn,
             min_size=min_pool_size,
@@ -456,6 +461,9 @@ class PostgresSagaStore:
             saga_id TEXT NOT NULL REFERENCES sagas(id) ON DELETE CASCADE,
             sequence BIGINT NOT NULL,
             action TEXT NOT NULL,
+            action_version TEXT,
+            action_definition_hash TEXT,
+            action_definition JSONB,
             input JSONB NOT NULL,
             status TEXT NOT NULL,
             result JSONB,
@@ -466,9 +474,13 @@ class PostgresSagaStore:
             fence_token BIGINT NOT NULL DEFAULT 0,
             UNIQUE(saga_id, sequence)
         );
+        ALTER TABLE steps ADD COLUMN IF NOT EXISTS action_version TEXT;
+        ALTER TABLE steps ADD COLUMN IF NOT EXISTS action_definition_hash TEXT;
+        ALTER TABLE steps ADD COLUMN IF NOT EXISTS action_definition JSONB;
         CREATE INDEX IF NOT EXISTS idx_sagas_session ON sagas(session_id, id);
         CREATE INDEX IF NOT EXISTS idx_sagas_recovery ON sagas(status, lease_until, updated_at);
         CREATE INDEX IF NOT EXISTS idx_steps_saga_status ON steps(saga_id, status, sequence);
+        CREATE INDEX IF NOT EXISTS idx_steps_action_version ON steps(action, action_version);
         """
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -547,10 +559,13 @@ class PostgresSagaStore:
                 sequence = row["sequence"]
                 result = conn.execute(
                     """INSERT INTO steps
-                    (id,saga_id,sequence,action,input,status,result,error,compensation_attempts,created_at,updated_at,fence_token)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                    (id,saga_id,sequence,action,action_version,action_definition_hash,action_definition,input,status,result,error,compensation_attempts,created_at,updated_at,fence_token)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
                     (
-                        step["id"], step["saga_id"], sequence, step["action"], self._json(step["input"]), step["status"],
+                        step["id"], step["saga_id"], sequence, step["action"], step.get("action_version"),
+                        step.get("action_definition_hash"),
+                        self._json(step.get("action_definition")) if step.get("action_definition") is not None else None,
+                        self._json(step["input"]), step["status"],
                         self._json(step.get("result")) if step.get("result") is not None else None, step.get("error"),
                         step.get("compensation_attempts", 0), step["created_at"], step["updated_at"], fence_token or 0,
                     ),
