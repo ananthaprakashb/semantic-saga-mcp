@@ -35,6 +35,33 @@ class ExecuteArguments(SagaArguments):
     input: dict[str, Any]
 
 
+class PlanStepArguments(ExecuteArguments):
+    key: StrictStr | None = None
+    depends_on: list[StrictStr] = Field(default_factory=list)
+    approval_required: bool | None = None
+
+
+class RunReadyArguments(SagaArguments):
+    max_parallel: int = Field(default=4, ge=1, le=32)
+    max_steps: int = Field(default=100, ge=1, le=1000)
+
+
+class ApprovalArguments(SagaArguments):
+    node_id: StrictStr = Field(min_length=1)
+    approved: bool = True
+    reason: StrictStr | None = None
+
+
+class RetryStepArguments(SagaArguments):
+    node_id: StrictStr = Field(min_length=1)
+    force: bool = False
+
+
+class CheckpointArguments(SagaArguments):
+    name: StrictStr = Field(min_length=1)
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class ListActionsArguments(StrictModel):
     pass
 
@@ -48,6 +75,11 @@ class ToolCallParams(StrictModel):
     name: Literal[
         "begin_saga",
         "execute_saga_step",
+        "plan_saga_step",
+        "run_ready_steps",
+        "approve_saga_step",
+        "retry_saga_step",
+        "checkpoint_saga",
         "commit_saga",
         "rollback_saga",
         "trigger_rollback",
@@ -73,6 +105,11 @@ class JsonRpcRequest(StrictModel):
 ARGUMENT_MODELS = {
     "begin_saga": BeginArguments,
     "execute_saga_step": ExecuteArguments,
+    "plan_saga_step": PlanStepArguments,
+    "run_ready_steps": RunReadyArguments,
+    "approve_saga_step": ApprovalArguments,
+    "retry_saga_step": RetryStepArguments,
+    "checkpoint_saga": CheckpointArguments,
     "commit_saga": SagaArguments,
     "rollback_saga": SagaArguments,
     "trigger_rollback": SagaArguments,
@@ -83,19 +120,25 @@ ARGUMENT_MODELS = {
 
 TOOLS = [
     {"name": "begin_saga", "description": "Start a durable transactional workflow.", "inputSchema": BeginArguments.model_json_schema()},
-    {"name": "execute_saga_step", "description": "Execute the active immutable version of a registered action and durably snapshot its compensation contract.", "inputSchema": ExecuteArguments.model_json_schema()},
-    {"name": "commit_saga", "description": "Commit a successfully completed saga; it can no longer be rolled back.", "inputSchema": SagaArguments.model_json_schema()},
-    {"name": "rollback_saga", "description": "Compensate saga steps in reverse order using each step's persisted action definition.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "execute_saga_step", "description": "Immediately execute the active immutable action version. This compatibility path still applies action retry/failure policy.", "inputSchema": ExecuteArguments.model_json_schema()},
+    {"name": "plan_saga_step", "description": "Persist a version-pinned workflow node with dependencies and optional approval before any side effect occurs.", "inputSchema": PlanStepArguments.model_json_schema()},
+    {"name": "run_ready_steps", "description": "Execute ready DAG nodes in dependency waves, running independent nodes concurrently under one fenced saga lease.", "inputSchema": RunReadyArguments.model_json_schema()},
+    {"name": "approve_saga_step", "description": "Approve or reject a workflow node that is waiting for human/operator approval.", "inputSchema": ApprovalArguments.model_json_schema()},
+    {"name": "retry_saga_step", "description": "Return a failed/rejected/blocked workflow node to scheduling; uncertain outcomes require explicit force after reconciliation.", "inputSchema": RetryStepArguments.model_json_schema()},
+    {"name": "checkpoint_saga", "description": "Persist a named workflow checkpoint and operator/agent-provided checkpoint data.", "inputSchema": CheckpointArguments.model_json_schema()},
+    {"name": "commit_saga", "description": "Commit a successfully completed saga; all planned workflow nodes must be COMPLETED.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "rollback_saga", "description": "Compensate saga steps in reverse order using each step's persisted action definition and compensation retry policy.", "inputSchema": SagaArguments.model_json_schema()},
     {"name": "trigger_rollback", "description": "Immediately compensate saga steps in reverse order after an error.", "inputSchema": SagaArguments.model_json_schema()},
-    {"name": "get_saga", "description": "Inspect saga and step status, action versions, results, and rollback failures.", "inputSchema": SagaArguments.model_json_schema()},
-    {"name": "list_actions", "description": "List active action contracts, versions, schemas, semantic effects, risk, and definition hashes.", "inputSchema": ListActionsArguments.model_json_schema()},
+    {"name": "get_saga", "description": "Inspect saga, workflow DAG, checkpoints, action versions, results, approvals, and recovery state.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "list_actions", "description": "List active action contracts, schemas, semantic effects, risk, hashes, and resolved execution policies.", "inputSchema": ListActionsArguments.model_json_schema()},
     {"name": "get_action", "description": "Inspect one registered action contract by id and optional version.", "inputSchema": GetActionArguments.model_json_schema()},
 ]
 
 SYSTEM_PROMPT = (
-    "When executing multi-step infrastructure changes, wrap your actions in the Saga Coordinator. "
-    "Use `list_actions` or `get_action` to inspect action schemas and semantic risk before execution. "
-    "If you encounter an error, immediately call the `trigger_rollback` tool."
+    "Wrap multi-step side effects in the Saga Coordinator. Inspect actions with `list_actions` or `get_action`. "
+    "For orchestrated work, use `plan_saga_step` with dependencies, obtain approvals when required, then call "
+    "`run_ready_steps`. Use checkpoints for durable milestones. If a saga enters RECOVERY_REQUIRED, reconcile the "
+    "external outcome before forcing a retry; otherwise roll back."
 )
 PROMPTS = [
     {
@@ -150,8 +193,25 @@ class McpServer:
         args = ARGUMENT_MODELS[params.name].model_validate(params.arguments)
         if isinstance(args, BeginArguments):
             value = self.coordinator.begin(args.metadata, session_id=session_id)
+        elif isinstance(args, PlanStepArguments):
+            value = self.coordinator.plan_step(
+                args.saga_id, args.action, args.input, session_id=session_id,
+                key=args.key, depends_on=list(args.depends_on), approval_required=args.approval_required,
+            )
         elif isinstance(args, ExecuteArguments):
             value = self.coordinator.execute(args.saga_id, args.action, args.input, session_id=session_id)
+        elif isinstance(args, RunReadyArguments):
+            value = self.coordinator.run_ready_steps(
+                args.saga_id, session_id=session_id, max_parallel=args.max_parallel, max_steps=args.max_steps
+            )
+        elif isinstance(args, ApprovalArguments):
+            value = self.coordinator.approve_step(
+                args.saga_id, args.node_id, session_id=session_id, approved=args.approved, reason=args.reason
+            )
+        elif isinstance(args, RetryStepArguments):
+            value = self.coordinator.retry_step(args.saga_id, args.node_id, session_id=session_id, force=args.force)
+        elif isinstance(args, CheckpointArguments):
+            value = self.coordinator.checkpoint(args.saga_id, args.name, args.data, session_id=session_id)
         elif isinstance(args, ListActionsArguments):
             value = self.coordinator.list_actions()
         elif isinstance(args, GetActionArguments):
@@ -286,11 +346,7 @@ def main() -> None:
             )
 
     if args.postgres_dsn:
-        store = PostgresSagaStore(
-            args.postgres_dsn,
-            min_pool_size=args.postgres_pool_min,
-            max_pool_size=args.postgres_pool_max,
-        )
+        store = PostgresSagaStore(args.postgres_dsn, min_pool_size=args.postgres_pool_min, max_pool_size=args.postgres_pool_max)
     elif args.database:
         store = SQLiteSagaStore(args.database)
     else:
@@ -332,12 +388,7 @@ def main() -> None:
             "additionalProperties": False,
         },
     )
-    coordinator = Coordinator(
-        store,
-        registry,
-        worker_id=args.worker_id,
-        lease_seconds=args.lease_seconds,
-    )
+    coordinator = Coordinator(store, registry, worker_id=args.worker_id, lease_seconds=args.lease_seconds)
     recovered = coordinator.resume_pending_rollbacks(limit=args.recovery_limit)
     if recovered:
         logger(f"[recovery] worker {coordinator.worker_id} recovered {len(recovered)} saga(s)")
@@ -345,7 +396,6 @@ def main() -> None:
     if args.transport == "sse":
         print("[deprecated] dedicated SSE transport is retained only for migration; use --transport streamable-http", file=sys.stderr, flush=True)
         import uvicorn
-
         uvicorn.run(McpServer(coordinator).sse_app(), host=args.host, port=args.port)
         return
 
@@ -365,7 +415,6 @@ def main() -> None:
 
     if args.transport == "stdio":
         import anyio
-
         anyio.run(run_stdio, mcp_server)
         return
 
@@ -386,7 +435,6 @@ def main() -> None:
     token_verifier = None
     if native_auth:
         from .auth import JwtTokenVerifier, StaticTokenVerifier
-
         auth_settings = AuthSettings(
             issuer_url=AnyHttpUrl(args.auth_issuer),
             resource_server_url=AnyHttpUrl(args.auth_resource_url),
