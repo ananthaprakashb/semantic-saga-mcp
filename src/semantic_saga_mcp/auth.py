@@ -20,12 +20,7 @@ class AuthorizationError(RuntimeError):
 
 
 class StaticTokenVerifier(TokenVerifier):
-    """Development/test verifier loaded from an operator-owned JSON file.
-
-    The file is a mapping from bearer token to AccessToken-compatible fields.
-    It is intentionally not a production credential store; production remote
-    deployments should use signed JWT access tokens from an external IdP.
-    """
+    """Development/test verifier loaded from an operator-owned JSON file."""
 
     def __init__(self, tokens: dict[str, AccessToken]) -> None:
         self._tokens = tokens
@@ -138,6 +133,11 @@ class AuthorizationPolicy:
         {
             "begin_saga",
             "execute_saga_step",
+            "plan_saga_step",
+            "run_ready_steps",
+            "approve_saga_step",
+            "retry_saga_step",
+            "checkpoint_saga",
             "commit_saga",
             "rollback_saga",
             "trigger_rollback",
