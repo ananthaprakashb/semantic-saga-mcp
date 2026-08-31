@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import os
 import time
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping
 
@@ -13,6 +13,9 @@ from opentelemetry.trace import Status, StatusCode
 
 
 TRACE_META_KEYS = ("traceparent", "tracestate", "baggage")
+_actor_context: ContextVar[tuple[str | None, str | None]] = ContextVar(
+    "semantic_saga_actor", default=(None, None)
+)
 
 
 def _primitive_attributes(values: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -34,6 +37,19 @@ def current_trace_ids() -> tuple[str | None, str | None]:
     if not span_context.is_valid:
         return None, None
     return f"{span_context.trace_id:032x}", f"{span_context.span_id:016x}"
+
+
+def current_actor() -> tuple[str | None, str | None]:
+    return _actor_context.get()
+
+
+@contextlib.contextmanager
+def actor_scope(principal_id: str | None, principal_type: str | None) -> Iterator[None]:
+    token = _actor_context.set((principal_id, principal_type))
+    try:
+        yield
+    finally:
+        _actor_context.reset(token)
 
 
 def inject_current_trace(headers: dict[str, str]) -> None:
@@ -69,6 +85,22 @@ def attach_mcp_trace(meta: Mapping[str, Any] | None, headers: Mapping[str, Any] 
         yield
         return
     token = otel_context.attach(propagate.extract(carrier))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
+
+def capture_otel_context() -> Any:
+    return otel_context.get_current()
+
+
+@contextlib.contextmanager
+def attach_otel_context(ctx: Any | None) -> Iterator[None]:
+    if ctx is None:
+        yield
+        return
+    token = otel_context.attach(ctx)
     try:
         yield
     finally:
