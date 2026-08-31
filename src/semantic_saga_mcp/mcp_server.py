@@ -24,7 +24,15 @@ from . import __version__
 from .auth import AuthorizationError, AuthorizationPolicy, IdentityError
 from .coordinator import Coordinator, SagaError
 from .execution import ExecutionContextResolver
-from .server import ARGUMENT_MODELS, BeginArguments, ExecuteArguments, SYSTEM_PROMPT, TOOLS
+from .server import (
+    ARGUMENT_MODELS,
+    BeginArguments,
+    ExecuteArguments,
+    GetActionArguments,
+    ListActionsArguments,
+    SYSTEM_PROMPT,
+    TOOLS,
+)
 
 
 PROMPT = Prompt(
@@ -79,7 +87,6 @@ def build_mcp_server(
             def invoke() -> dict[str, Any]:
                 if isinstance(args, BeginArguments):
                     metadata = dict(args.metadata)
-                    # Reserved system field: caller input can never spoof creator identity.
                     metadata["_identity"] = execution.audit_metadata()
                     return coordinator.begin(
                         metadata,
@@ -94,6 +101,10 @@ def build_mcp_server(
                         args.input,
                         session_id=execution.owner_id,
                     )
+                if isinstance(args, ListActionsArguments):
+                    return coordinator.list_actions()
+                if isinstance(args, GetActionArguments):
+                    return coordinator.get_action(args.action, args.version)
                 if params.name == "commit_saga":
                     return coordinator.commit(args.saga_id, session_id=execution.owner_id)
                 if params.name in {"rollback_saga", "trigger_rollback"}:
