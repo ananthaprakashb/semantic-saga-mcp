@@ -257,8 +257,30 @@ class StoreAuditJournal:
             ]
         return rows[:limit]
 
+    def _all(self, saga_id: str) -> list[dict[str, Any]]:
+        """Read the complete chain for integrity verification, without API paging limits."""
+        if self.kind == "sqlite":
+            with self.store._lock:
+                rows = [
+                    dict(row)
+                    for row in self.store._db.execute(
+                        "SELECT * FROM audit_events WHERE saga_id=? ORDER BY sequence ASC",
+                        (saga_id,),
+                    ).fetchall()
+                ]
+            return [self._public(row) for row in rows]
+        if self.kind == "postgres":
+            with self.store._pool.connection() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM audit_events WHERE saga_id=%s ORDER BY sequence ASC",
+                    (saga_id,),
+                ).fetchall()
+            return [self._public(row) for row in rows]
+        with self._memory_lock:
+            return [copy.deepcopy(row) for row in self._memory if row["saga_id"] == saga_id]
+
     def verify(self, saga_id: str) -> dict[str, Any]:
-        rows = self.list(saga_id, limit=5000)
+        rows = self._all(saga_id)
         previous_hash: str | None = None
         for row in rows:
             body = {
