@@ -5,9 +5,11 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
+
+from .secrets import EnvironmentSecretProvider, SecretProvider, resolve_secret_value
 
 
 class ActionError(RuntimeError):
@@ -42,7 +44,6 @@ def render(value: Any, context: dict[str, Any]) -> Any:
 
 
 def _render_preview(value: Any, context: dict[str, Any]) -> Any:
-    """Render known values while retaining unavailable result placeholders."""
     try:
         return render(value, context)
     except (ActionError, KeyError, TypeError):
@@ -54,14 +55,22 @@ class HttpRequest:
     url: str
     method: str = "POST"
     body: Any = None
-    headers: dict[str, str] | None = None
+    headers: dict[str, Any] | None = None
     timeout_seconds: float = 30
+    secret_provider: SecretProvider | None = field(default=None, repr=False, compare=False)
+
+    @staticmethod
+    def _is_secret_ref(value: Any) -> bool:
+        return isinstance(value, dict) and "secret_ref" in value
 
     def preview(self, context: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
-        headers = {
-            str(key): "<redacted>" if str(key).lower() in {"authorization", "cookie", "proxy-authorization", "x-api-key"} else str(_render_preview(value, context))
-            for key, value in (self.headers or {}).items()
-        }
+        headers: dict[str, str] = {}
+        for key, value in (self.headers or {}).items():
+            normalized = str(key).lower()
+            if normalized in {"authorization", "cookie", "proxy-authorization", "x-api-key"} or self._is_secret_ref(value):
+                headers[str(key)] = "<redacted>"
+            else:
+                headers[str(key)] = str(_render_preview(value, context))
         headers.setdefault("Idempotency-Key", idempotency_key)
         return {
             "method": self.method.upper(),
@@ -70,10 +79,18 @@ class HttpRequest:
             "body": _render_preview(self.body, context),
         }
 
+    def _header(self, value: Any, context: dict[str, Any]) -> str:
+        # Secret references are operator-owned configuration and are deliberately
+        # not templated from agent input. This prevents callers from selecting a
+        # different credential at runtime.
+        if self._is_secret_ref(value):
+            return resolve_secret_value(value, self.secret_provider)
+        return str(render(value, context))
+
     def send(self, context: dict[str, Any], idempotency_key: str) -> Any:
         url = render(self.url, context)
         body = render(self.body, context)
-        headers = {str(k): str(render(v, context)) for k, v in (self.headers or {}).items()}
+        headers = {str(k): self._header(v, context) for k, v in (self.headers or {}).items()}
         headers.setdefault("Idempotency-Key", idempotency_key)
         data = None
         if body is not None:
@@ -160,8 +177,6 @@ class FileTransactionTool:
         return {"path": str(path)}
 
     def compensate(self, values: dict[str, Any], result: Any, saga_id: str, step_id: str) -> None:
-        # A failed forward action has no receipt and may have encountered a file
-        # owned by somebody else. Never delete unless this step reported success.
         if not isinstance(result, dict) or result.get("path") is None:
             return
         path = self._path(values.get("path"))
@@ -180,12 +195,28 @@ def _context(values: dict[str, Any], result: Any, saga_id: str, step_id: str) ->
     return {"input": values, "result": result, "saga": {"id": saga_id}, "step": {"id": step_id}}
 
 
-def load_actions(path: str, *, dry_run: bool = False, log: Callable[[str], None] | None = None) -> dict[str, Action]:
+def load_actions(
+    path: str,
+    *,
+    dry_run: bool = False,
+    log: Callable[[str], None] | None = None,
+    secret_provider: SecretProvider | None = None,
+) -> dict[str, Action]:
+    """Legacy action-loader API retained for embedders.
+
+    New server deployments use :func:`semantic_saga_mcp.registry.load_action_registry`
+    so version/hash snapshots are persisted with each saga step.
+    """
+
     with open(path, encoding="utf-8") as handle:
         definitions = json.load(handle)
     actions: dict[str, Action] = {}
     logger = log or (lambda message: print(message, file=sys.stderr, flush=True))
+    provider = secret_provider or EnvironmentSecretProvider()
     for name, definition in definitions.items():
-        action = HttpAction(HttpRequest(**definition["forward"]), HttpRequest(**definition["rollback"]))
+        action = HttpAction(
+            HttpRequest(secret_provider=provider, **definition["forward"]),
+            HttpRequest(secret_provider=provider, **definition["rollback"]),
+        )
         actions[name] = DryRunHttpAction(action, logger) if dry_run else action
     return actions
