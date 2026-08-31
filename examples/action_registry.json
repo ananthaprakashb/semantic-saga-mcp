@@ -33,6 +33,24 @@
         },
         "additionalProperties": true
       },
+      "execution_policy": {
+        "forward": {
+          "max_attempts": 3,
+          "initial_backoff_seconds": 0.5,
+          "backoff_multiplier": 2,
+          "max_backoff_seconds": 5,
+          "jitter": 0.2
+        },
+        "compensation": {
+          "max_attempts": 5,
+          "initial_backoff_seconds": 1,
+          "backoff_multiplier": 2,
+          "max_backoff_seconds": 15,
+          "jitter": 0.2
+        },
+        "failure_mode": "pause",
+        "approval_required": true
+      },
       "forward": {
         "url": "https://api.example.com/services",
         "method": "POST",
