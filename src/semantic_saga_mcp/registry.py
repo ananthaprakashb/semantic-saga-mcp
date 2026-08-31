@@ -11,6 +11,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError as JsonSchemaValidationError
 
 from .actions import Action, DryRunHttpAction, HttpAction, HttpRequest
+from .engine import EnginePolicyError, normalize_execution_policy
 from .secrets import EnvironmentSecretProvider, SecretProvider
 
 
@@ -38,6 +39,7 @@ class ActionDefinition:
     compensation: dict[str, Any] | None = None
     implementation: str | None = None
     implementation_hash: str | None = None
+    execution_policy: dict[str, Any] | None = None
     active: bool = True
 
     def __post_init__(self) -> None:
@@ -51,8 +53,16 @@ class ActionDefinition:
             Draft202012Validator.check_schema(self.input_schema)
             if self.output_schema is not None:
                 Draft202012Validator.check_schema(self.output_schema)
+            if self.execution_policy is not None:
+                normalize_execution_policy(self.execution_policy)
         except SchemaError as exc:
             raise ActionRegistryError(f"Invalid JSON Schema for {self.action_id}@{self.version}: {exc.message}") from exc
+        except EnginePolicyError as exc:
+            raise ActionRegistryError(f"Invalid execution policy for {self.action_id}@{self.version}: {exc}") from exc
+
+    @property
+    def policy(self) -> dict[str, Any]:
+        return normalize_execution_policy(self.execution_policy)
 
     def snapshot(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -72,6 +82,8 @@ class ActionDefinition:
             value["implementation"] = self.implementation
         if self.implementation_hash is not None:
             value["implementation_hash"] = self.implementation_hash
+        if self.execution_policy is not None:
+            value["execution_policy"] = self.execution_policy
         return value
 
     @property
@@ -92,6 +104,7 @@ class ActionDefinition:
                 compensation=dict(value["compensation"]) if value.get("compensation") is not None else None,
                 implementation=str(value["implementation"]) if value.get("implementation") is not None else None,
                 implementation_hash=str(value["implementation_hash"]) if value.get("implementation_hash") is not None else None,
+                execution_policy=dict(value["execution_policy"]) if value.get("execution_policy") is not None else None,
                 active=active,
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -166,6 +179,7 @@ class ActionRegistry:
         semantic: dict[str, Any] | None = None,
         input_schema: dict[str, Any] | None = None,
         output_schema: dict[str, Any] | None = None,
+        execution_policy: dict[str, Any] | None = None,
         active: bool = True,
     ) -> None:
         implementation, implementation_hash = self._runtime_implementation(action)
@@ -178,6 +192,7 @@ class ActionRegistry:
             output_schema=output_schema,
             implementation=implementation,
             implementation_hash=implementation_hash,
+            execution_policy=execution_policy,
             active=active,
         )
         key = (action_id, version)
@@ -263,6 +278,7 @@ class ActionRegistry:
                     "semantic": definition.semantic,
                     "input_schema": definition.input_schema,
                     "output_schema": definition.output_schema,
+                    "execution_policy": definition.policy,
                 }
             )
         return result
@@ -271,6 +287,7 @@ class ActionRegistry:
         definition = self.resolve(action_id, version).definition
         value = definition.snapshot()
         value["definition_hash"] = definition.hash
+        value["resolved_execution_policy"] = definition.policy
         return value
 
 
@@ -326,6 +343,7 @@ def load_action_registry(
             output_schema=dict(item["output_schema"]) if item.get("output_schema") is not None else None,
             forward=dict(item["forward"]) if item.get("forward") is not None else None,
             compensation=dict(item["compensation"]) if item.get("compensation") is not None else None,
+            execution_policy=dict(item["execution_policy"]) if item.get("execution_policy") is not None else None,
             active=bool(item.get("active", True)),
         )
         registry.register_definition(definition)
