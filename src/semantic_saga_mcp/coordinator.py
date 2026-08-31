@@ -98,19 +98,38 @@ class Coordinator:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self.store = store
+        self._legacy_actions: dict[str, Action] | None = None
         if isinstance(actions, ActionRegistry):
             self.registry = actions
+            self.actions = {
+                item["id"]: self.registry.resolve(item["id"]).action
+                for item in self.registry.list_definitions()
+            }
         else:
-            # Embedding compatibility: direct runtime actions receive immutable
-            # implementation hashes and allow pre-0.5 recovery only for callers
-            # that intentionally use the legacy constructor surface.
+            # Embedding compatibility: retain the caller's mutable dictionary by
+            # reference, as releases before 0.5 did. New/changed entries are
+            # synchronized into the runtime registry at the point of use.
+            self._legacy_actions = actions
             self.registry = ActionRegistry(allow_legacy_recovery=True)
             for name, action in actions.items():
                 self.registry.register_runtime(name, action)
-        self.actions = {item["id"]: self.registry.resolve(item["id"]).action for item in self.registry.list_definitions()}
+            self.actions = actions
         self.compensation_retries = compensation_retries
         self.worker_id = worker_id or f"worker:{uuid.uuid4()}"
         self.lease_seconds = lease_seconds
+
+    def _sync_legacy_action(self, action_name: str) -> None:
+        if self._legacy_actions is None:
+            return
+        action = self._legacy_actions.get(action_name)
+        if action is None:
+            return
+        try:
+            current = self.registry.resolve(action_name)
+        except ActionRegistryError:
+            current = None
+        if current is None or current.action is not action:
+            self.registry.register_runtime(action_name, action)
 
     def begin(
         self,
@@ -153,6 +172,7 @@ class Coordinator:
                 saga = self._require(saga_id, session_id)
                 if saga["status"] != "ACTIVE":
                     raise SagaError(f"Saga {saga_id} is {saga['status']}; steps require ACTIVE")
+                self._sync_legacy_action(action_name)
                 try:
                     registered = self.registry.prepare(action_name, values)
                 except ActionRegistryError as exc:
@@ -269,6 +289,7 @@ class Coordinator:
                 failures = []
                 for step in steps:
                     lease.check()
+                    self._sync_legacy_action(step["action"])
                     try:
                         registered = self.registry.resolve_for_step(step)
                     except ActionRegistryError as exc:
