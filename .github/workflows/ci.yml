@@ -25,6 +25,19 @@ jobs:
       - run: python -m pip install .
       - run: python -m unittest discover -s tests -v
 
+  observability-smoke:
+    name: OpenTelemetry optional stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install '.[otel]'
+      - name: Verify W3C propagation and OTel SDK compatibility
+        run: python -m unittest tests.test_observability -v
+
   transport-smoke:
     name: MCP 2026 transport smoke
     runs-on: ubuntu-latest
@@ -78,12 +91,15 @@ jobs:
                   assert not fetched.is_error, fetched
                   assert fetched.structured_content["id"] == saga_id
                   assert fetched.structured_content["status"] == "ACTIVE"
+                  integrity = await second.call_tool("verify_audit_chain", {"saga_id": saga_id})
+                  assert not integrity.is_error, integrity
+                  assert integrity.structured_content["valid"] is True
 
           asyncio.run(main())
           PY
 
   auth-smoke:
-    name: OAuth tenant and RBAC smoke
+    name: OAuth tenant, RBAC, and audit smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -92,7 +108,7 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install .
-      - name: Verify bearer gate, same-tenant handoff, RBAC, and tenant isolation
+      - name: Verify bearer gate, same-tenant handoff, RBAC, tenant isolation, and audit reads
         shell: bash
         run: |
           set -euo pipefail
@@ -105,19 +121,19 @@ jobs:
               "client_id": "agent-client",
               "subject": "alice",
               "scopes": ["semantic-saga"],
-              "claims": {"tenant_id": "acme", "roles": ["operator"]}
+              "claims": {"tenant_id": "acme", "roles": ["operator"], "principal_type": "user"}
             },
             "viewer-token": {
               "client_id": "viewer-client",
               "subject": "bob",
               "scopes": ["semantic-saga"],
-              "claims": {"tenant_id": "acme", "roles": ["viewer"]}
+              "claims": {"tenant_id": "acme", "roles": ["viewer"], "principal_type": "user"}
             },
             "outsider-token": {
               "client_id": "other-client",
               "subject": "mallory",
               "scopes": ["semantic-saga"],
-              "claims": {"tenant_id": "other", "roles": ["operator"]}
+              "claims": {"tenant_id": "other", "roles": ["operator"], "principal_type": "user"}
             }
           }
           JSON
@@ -166,7 +182,7 @@ jobs:
           async def main() -> None:
               operator_http, operator_target = await client_for("operator-token")
               async with operator_http, operator_target as operator:
-                  created = await operator.call_tool("begin_saga", {"metadata": {"case": "phase2"}})
+                  created = await operator.call_tool("begin_saga", {"metadata": {"case": "phase6"}})
                   assert not created.is_error, created
                   saga_id = created.structured_content["id"]
                   identity = created.structured_content["metadata"]["_identity"]
@@ -177,6 +193,12 @@ jobs:
               async with viewer_http, viewer_target as viewer:
                   fetched = await viewer.call_tool("get_saga", {"saga_id": saga_id})
                   assert not fetched.is_error, fetched
+                  timeline = await viewer.call_tool("get_saga_timeline", {"saga_id": saga_id})
+                  assert not timeline.is_error, timeline
+                  assert timeline.structured_content["audit_integrity"]["valid"] is True
+                  audit = await viewer.call_tool("get_audit_events", {"saga_id": saga_id})
+                  assert not audit.is_error, audit
+                  assert audit.structured_content["events"][0]["actor_principal_id"] == "alice"
                   denied = await viewer.call_tool("commit_saga", {"saga_id": saga_id})
                   assert denied.is_error, denied
                   assert "not authorized" in denied.content[0].text
@@ -186,6 +208,9 @@ jobs:
                   hidden = await outsider.call_tool("get_saga", {"saga_id": saga_id})
                   assert hidden.is_error, hidden
                   assert "Saga not found" in hidden.content[0].text
+                  hidden_timeline = await outsider.call_tool("get_saga_timeline", {"saga_id": saga_id})
+                  assert hidden_timeline.is_error, hidden_timeline
+                  assert "Saga not found" in hidden_timeline.content[0].text
 
           asyncio.run(main())
           PY
