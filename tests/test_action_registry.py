@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from semantic_saga_mcp.actions import ActionError
 from semantic_saga_mcp.coordinator import Coordinator, SagaError
 from semantic_saga_mcp.registry import ActionDefinition, ActionRegistry, ActionRegistryError
 from semantic_saga_mcp.secrets import MappingSecretProvider
@@ -219,7 +218,7 @@ class ActionRegistryTests(unittest.TestCase):
                 "action": "provision",
                 "input": {"name": "old"},
                 "status": "EXECUTING",
-                "result": None,
+                "result": {"id": "acct-old"},
                 "error": None,
                 "compensation_attempts": 0,
                 "created_at": timestamp,
