@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from .observability import inject_current_trace
 from .secrets import EnvironmentSecretProvider, SecretProvider, resolve_secret_value
 
 
@@ -92,6 +93,9 @@ class HttpRequest:
         body = render(self.body, context)
         headers = {str(k): self._header(v, context) for k, v in (self.headers or {}).items()}
         headers.setdefault("Idempotency-Key", idempotency_key)
+        # Propagate only the active W3C trace context. OpenTelemetry injects no
+        # credential or request payload data into these headers.
+        inject_current_trace(headers)
         data = None
         if body is not None:
             data = json.dumps(body).encode()
