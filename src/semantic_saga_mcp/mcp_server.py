@@ -26,10 +26,15 @@ from .coordinator import Coordinator, SagaError
 from .execution import ExecutionContextResolver
 from .server import (
     ARGUMENT_MODELS,
+    ApprovalArguments,
     BeginArguments,
+    CheckpointArguments,
     ExecuteArguments,
     GetActionArguments,
     ListActionsArguments,
+    PlanStepArguments,
+    RetryStepArguments,
+    RunReadyArguments,
     SYSTEM_PROMPT,
     TOOLS,
 )
@@ -94,12 +99,53 @@ def build_mcp_server(
                         tenant_id=execution.tenant_id,
                         principal_id=execution.principal_id,
                     )
+                if isinstance(args, PlanStepArguments):
+                    return coordinator.plan_step(
+                        args.saga_id,
+                        args.action,
+                        args.input,
+                        session_id=execution.owner_id,
+                        key=args.key,
+                        depends_on=list(args.depends_on),
+                        approval_required=args.approval_required,
+                    )
                 if isinstance(args, ExecuteArguments):
                     return coordinator.execute(
                         args.saga_id,
                         args.action,
                         args.input,
                         session_id=execution.owner_id,
+                    )
+                if isinstance(args, RunReadyArguments):
+                    return coordinator.run_ready_steps(
+                        args.saga_id,
+                        session_id=execution.owner_id,
+                        max_parallel=args.max_parallel,
+                        max_steps=args.max_steps,
+                    )
+                if isinstance(args, ApprovalArguments):
+                    return coordinator.approve_step(
+                        args.saga_id,
+                        args.node_id,
+                        session_id=execution.owner_id,
+                        approved=args.approved,
+                        reason=args.reason,
+                        principal_id=execution.principal_id,
+                    )
+                if isinstance(args, RetryStepArguments):
+                    return coordinator.retry_step(
+                        args.saga_id,
+                        args.node_id,
+                        session_id=execution.owner_id,
+                        force=args.force,
+                    )
+                if isinstance(args, CheckpointArguments):
+                    return coordinator.checkpoint(
+                        args.saga_id,
+                        args.name,
+                        args.data,
+                        session_id=execution.owner_id,
+                        principal_id=execution.principal_id,
                     )
                 if isinstance(args, ListActionsArguments):
                     return coordinator.list_actions()
