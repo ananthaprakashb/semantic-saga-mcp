@@ -68,7 +68,7 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(approved.is_error)
             self.assertEqual(approved.structured_content["status"], "READY")
-            self.assertEqual(approved.structured_content["approval"]["principal_id"], "local-process")
+            self.assertEqual(approved.structured_content["approval"]["principal_id"], "stdio:phase5-test")
 
             executed = await client.call_tool(
                 "run_ready_steps",
