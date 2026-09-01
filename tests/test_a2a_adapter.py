@@ -35,6 +35,18 @@ class A2AAdapterTests(unittest.TestCase):
                 {"operation": "plan", "saga_id": "saga-1", "action": "x", "unknown": True}
             )
 
+    def test_protobuf_integer_control_values_are_normalized(self):
+        command = A2ACommand.model_validate(
+            {"operation": "run", "saga_id": "saga-1", "max_parallel": 2.0, "max_steps": 10.0}
+        )
+        self.assertEqual(command.max_parallel, 2)
+        self.assertIsInstance(command.max_parallel, int)
+        self.assertEqual(command.max_steps, 10)
+        with self.assertRaises(ValidationError):
+            A2ACommand.model_validate(
+                {"operation": "run", "saga_id": "saga-1", "max_parallel": 2.5}
+            )
+
     def test_tenant_owner_is_stable_and_tenant_scoped(self):
         self.assertEqual(tenant_owner_id("acme"), tenant_owner_id("acme"))
         self.assertNotEqual(tenant_owner_id("acme"), tenant_owner_id("other"))
