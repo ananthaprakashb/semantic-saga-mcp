@@ -2,7 +2,7 @@
 
 A standalone [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that applies the Saga pattern to agentic workflows. It executes allow-listed side effects, journals intent before execution, and invokes compensating actions when work must unwind.
 
-Version 0.6 adds the **Semantic Saga Engine** on top of MCP `2026-07-28`, enterprise identity, PostgreSQL distributed durability, and the immutable Enterprise Action Registry. Organizations can now plan dependency graphs, require approvals, execute independent nodes concurrently, apply versioned retry policies, persist checkpoints, and pause risky failures for operator recovery.
+Version 0.7 adds **OpenTelemetry observability and tamper-evident audit** on top of the Phase 5 Semantic Saga Engine, MCP `2026-07-28`, enterprise identity, PostgreSQL distributed durability, and the immutable Enterprise Action Registry. Organizations can now correlate MCP requests with saga/action traces, export operational metrics, inspect a payload-safe execution timeline, and verify a durable per-saga audit hash chain.
 
 ## Core guarantees
 
@@ -21,6 +21,10 @@ Version 0.6 adds the **Semantic Saga Engine** on top of MCP `2026-07-28`, enterp
 - **Secret references:** credential values are resolved at execution time and are not persisted in action snapshots or dry-run output.
 - **Tenant isolation + OAuth/RBAC:** remote MCP workflows remain organization scoped and authorization controlled.
 - **Distributed safety:** renewable saga leases, fencing tokens, atomic step sequencing, and PostgreSQL `SKIP LOCKED` recovery prevent stale or duplicate workers from owning the same saga.
+- **Distributed tracing:** MCP SEP-414/W3C trace context is correlated through MCP, saga/workflow, and downstream HTTP action spans.
+- **Low-cardinality metrics:** action/compensation attempts and durations, approval decisions, recovery operations, and saga lifecycle operations can be exported with OpenTelemetry.
+- **Durable audit evidence:** control-plane events are append-only through the application API and hash-chained per saga in memory, SQLite, or PostgreSQL.
+- **Payload-safe diagnostics:** audit/timeline output omits action input/result payloads, credential material, HTTP bodies, resolved secrets, and checkpoint payloads.
 
 Semantic Saga coordinates systems that do not share an ACID transaction. A compensation can still fail; those failures are surfaced as `ROLLBACK_FAILED` for later operator handling.
 
@@ -53,7 +57,47 @@ semantic-saga-mcp \
   --actions ./examples/action_registry.json
 ```
 
-See [`docs/enterprise_identity.md`](docs/enterprise_identity.md) for OAuth/OIDC deployment and [`docs/distributed_durability.md`](docs/distributed_durability.md) for PostgreSQL leases/fencing.
+See [`docs/enterprise_identity.md`](docs/enterprise_identity.md) for OAuth/OIDC deployment, [`docs/distributed_durability.md`](docs/distributed_durability.md) for PostgreSQL leases/fencing, and [`docs/observability_audit.md`](docs/observability_audit.md) for tracing, metrics, and audit.
+
+## Observability and audit
+
+The base package includes the OpenTelemetry API and works without a collector. To export OTLP/HTTP traces and metrics, install the optional observability extra:
+
+```bash
+python -m pip install 'semantic-saga-mcp[otel]'
+```
+
+Then configure an OpenTelemetry Collector base endpoint:
+
+```bash
+semantic-saga-mcp \
+  --transport streamable-http \
+  --otel-endpoint http://otel-collector:4318
+```
+
+Environment equivalents include:
+
+```text
+SAGA_OTEL_ENDPOINT
+SAGA_OTEL_HEADERS
+SAGA_OTEL_SERVICE_NAME
+OTEL_EXPORTER_OTLP_ENDPOINT
+OTEL_EXPORTER_OTLP_HEADERS
+```
+
+Semantic Saga accepts W3C `traceparent`, `tracestate`, and `baggage` through MCP request `_meta` as standardized by MCP SEP-414. Streamable HTTP headers are a fallback when the corresponding `_meta` value is absent. Active trace context is injected into downstream HTTP actions.
+
+The durable audit journal is stored alongside saga state. Audit events include control-plane identifiers/statuses, actor identity, action/version, retry/approval metadata, timestamps, and trace/span correlation when available. They intentionally exclude action input/result objects and secret-bearing request data.
+
+Each saga has a SHA-256 chain:
+
+```text
+previous_hash -> event_hash -> next previous_hash -> ...
+```
+
+`verify_audit_chain` recomputes the complete chain. This is **tamper-evident**, not a substitute for independently anchored/WORM evidence: a database administrator with unrestricted rewrite access could rewrite the data and recompute hashes.
+
+See [`docs/observability_audit.md`](docs/observability_audit.md).
 
 ## Semantic Saga Engine
 
@@ -169,7 +213,7 @@ The built-in provider supports `env://NAME`. The Python `SecretProvider` protoco
 
 ### In-memory
 
-Use `SagaStore` for tests and ephemeral development.
+Use `SagaStore` for tests and ephemeral development. Audit rows are also in-memory and disappear with the process.
 
 ### SQLite
 
@@ -177,7 +221,7 @@ Use `SagaStore` for tests and ephemeral development.
 semantic-saga-mcp --database ./semantic-saga.db
 ```
 
-SQLite uses WAL mode and is intended for one Semantic Saga deployment. Workflow DAG state is persisted inside the saga metadata JSON, while concrete action executions continue to use the durable steps table.
+SQLite uses WAL mode and is intended for one Semantic Saga deployment. Workflow DAG state is persisted inside the saga metadata JSON, concrete action executions use the durable steps table, and Phase 6 audit events use an `audit_events` table in the same database.
 
 ### PostgreSQL
 
@@ -192,7 +236,7 @@ semantic-saga-mcp \
   --postgres-pool-max 20
 ```
 
-PostgreSQL is recommended when several Semantic Saga replicas share one journal. The saga lease remains the ownership boundary: one replica owns a saga, and that owner may execute several independent ready nodes concurrently using the existing PostgreSQL connection pool and fencing token.
+PostgreSQL is recommended when several Semantic Saga replicas share one journal. The saga lease remains the ownership boundary: one replica owns a saga, and that owner may execute several independent ready nodes concurrently using the existing PostgreSQL connection pool and fencing token. Audit events use the same pool; PostgreSQL advisory locking serializes hash-chain appends per saga.
 
 ## Enterprise identity
 
@@ -200,7 +244,7 @@ For organization-wide HTTP deployment, Semantic Saga can validate OAuth/OIDC JWT
 
 Roles/scopes:
 
-| Identity | Read | Orchestrate / execute | Commit / rollback |
+| Identity | Read saga/registry/audit | Orchestrate / execute | Commit / rollback |
 | --- | --- | --- | --- |
 | `viewer` | yes | no | no |
 | `operator` | yes | yes | yes |
@@ -224,7 +268,10 @@ Equivalent scopes are `semantic-saga:read`, `semantic-saga:execute`, and `semant
 | `commit_saga` | Commit only after all planned nodes complete. |
 | `rollback_saga` | Compensate eligible concrete steps in reverse order. |
 | `trigger_rollback` | Immediately start compensation after a client-detected failure. |
-| `get_saga` | Inspect saga, workflow DAG, approvals, checkpoints, steps, and recovery state. |
+| `get_saga` | Inspect full saga, workflow DAG, approvals, checkpoints, steps, and recovery state. |
+| `get_saga_timeline` | Inspect a payload-safe execution timeline plus audit integrity. |
+| `get_audit_events` | Read ordered append-only audit evidence, optionally filtered by event type. |
+| `verify_audit_chain` | Recompute the complete per-saga SHA-256 hash chain. |
 
 ## Built-in file transaction
 
@@ -240,13 +287,15 @@ semantic-saga-mcp --allow-legacy-action-recovery
 
 Legacy action-map JSON remains readable; newly executed legacy actions are journaled as immutable `legacy-v1` contracts.
 
+Phase 6 creates the audit table automatically when an instrumented server starts. Existing saga and step rows require no rewrite.
+
 ## Development and CI
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Pull requests validate Python 3.10–3.13, MCP 2026 Streamable HTTP, OAuth tenant/RBAC and JWT behavior, package/Twine checks, action-registry recovery invariants, Phase 5 DAG/retry/approval/recovery behavior, and PostgreSQL 16 concurrency/fencing/recovery/server-startup guarantees.
+Pull requests validate Python 3.10–3.13, MCP 2026 Streamable HTTP, OAuth tenant/RBAC and JWT behavior, package/Twine checks, action-registry recovery invariants, DAG/retry/approval/recovery behavior, audit integrity/payload safety, an optional OpenTelemetry SDK/exporter stack, W3C trace propagation, and PostgreSQL 16 concurrency/fencing/recovery/audit/server-startup guarantees.
 
 ## Publishing
 
@@ -258,3 +307,4 @@ The repository uses PyPI trusted publishing. Before release, update `__version__
 - [`docs/phase3_summary.md`](docs/phase3_summary.md) — PostgreSQL distributed durability.
 - [`docs/phase4_summary.md`](docs/phase4_summary.md) — immutable enterprise action registry, schemas, semantics, and secret references.
 - [`docs/phase5_summary.md`](docs/phase5_summary.md) — DAG orchestration, retries, approvals, checkpoints, parallel execution, and operator recovery.
+- [`docs/phase6_summary.md`](docs/phase6_summary.md) — OpenTelemetry traces/metrics, durable hash-chained audit, and execution timelines.

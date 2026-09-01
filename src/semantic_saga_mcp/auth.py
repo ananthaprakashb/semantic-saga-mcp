@@ -128,7 +128,16 @@ class AuthorizationPolicy:
     execute_scope: str = "semantic-saga:execute"
     admin_scope: str = "semantic-saga:admin"
 
-    READ_TOOLS = frozenset({"get_saga", "list_actions", "get_action"})
+    READ_TOOLS = frozenset(
+        {
+            "get_saga",
+            "get_saga_timeline",
+            "get_audit_events",
+            "verify_audit_chain",
+            "list_actions",
+            "get_action",
+        }
+    )
     MUTATION_TOOLS = frozenset(
         {
             "begin_saga",
