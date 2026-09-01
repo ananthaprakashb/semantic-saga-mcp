@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any, Literal, Mapping
 
 import anyio
@@ -11,6 +12,8 @@ from .coordinator import SagaError
 from .observability import actor_scope, attach_mcp_trace
 from .policy import PolicySubject, policy_subject_scope
 
+
+logger = logging.getLogger(__name__)
 
 _OPERATION_TO_TOOL = {
     "begin": "begin_saga",
@@ -262,7 +265,7 @@ class SemanticSagaA2AExecutor:
             await updater.add_artifact(
                 parts=[_result_part(result)],
                 name="semantic-saga-result",
-                description=f"Structured result for {command.operation}",
+                metadata={"semantic_saga_operation": command.operation},
             )
             await updater.update_status(
                 state=TaskState.TASK_STATE_COMPLETED,
@@ -274,6 +277,7 @@ class SemanticSagaA2AExecutor:
                 message=new_text_message(str(exc)[:1000]),
             )
         except Exception as exc:
+            logger.exception("A2A command execution failed")
             await updater.update_status(
                 state=TaskState.TASK_STATE_FAILED,
                 message=new_text_message(f"Semantic Saga command failed: {type(exc).__name__}"),
