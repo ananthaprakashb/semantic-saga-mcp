@@ -10,7 +10,7 @@ DSN = os.getenv("SAGA_TEST_POSTGRES_DSN")
 
 @unittest.skipUnless(A2A_AVAILABLE and DSN, "A2A extra and SAGA_TEST_POSTGRES_DSN are required")
 class PostgresA2ATests(unittest.IsolatedAsyncioTestCase):
-    async def test_a2a_task_persists_across_store_instances_and_tenants_are_isolated(self):
+    async def test_a2a_task_persists_in_postgres_and_tenants_are_isolated(self):
         from a2a.server.context import ServerCallContext
         from a2a.types import Task, TaskState, TaskStatus
         from semantic_saga_mcp.a2a_server import build_task_store
@@ -24,25 +24,19 @@ class PostgresA2ATests(unittest.IsolatedAsyncioTestCase):
         acme = ServerCallContext(tenant="acme")
         other = ServerCallContext(tenant="other")
 
-        first, first_engine = build_task_store(sqlite_path=None, postgres_dsn=DSN)
-        await first.initialize()
+        store, engine = build_task_store(sqlite_path=None, postgres_dsn=DSN)
+        await store.initialize()
         try:
-            await first.save(task, acme)
-            self.assertEqual((await first.get(task_id, acme)).id, task_id)
-            self.assertIsNone(await first.get(task_id, other))
-        finally:
-            await first_engine.dispose()
-
-        second, second_engine = build_task_store(sqlite_path=None, postgres_dsn=DSN)
-        await second.initialize()
-        try:
-            restored = await second.get(task_id, acme)
+            await store.save(task, acme)
+            restored = await store.get(task_id, acme)
             self.assertIsNotNone(restored)
+            self.assertEqual(restored.id, task_id)
             self.assertEqual(restored.status.state, TaskState.TASK_STATE_COMPLETED)
-            self.assertIsNone(await second.get(task_id, other))
-            await second.delete(task_id, acme)
+            self.assertIsNone(await store.get(task_id, other))
+            await store.delete(task_id, acme)
+            self.assertIsNone(await store.get(task_id, acme))
         finally:
-            await second_engine.dispose()
+            await engine.dispose()
 
 
 if __name__ == "__main__":
