@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "revision": "2026-08-31-example",
+  "default_effect": "deny",
+  "risk_weights": {
+    "low": 1,
+    "medium": 2,
+    "high": 5,
+    "critical": 10,
+    "unknown": 3
+  },
+  "tenants": {
+    "*": {
+      "default_effect": "allow",
+      "approval_at_or_above_risk": "high",
+      "budgets": {
+        "max_steps_per_saga": 100,
+        "max_planned_nodes": 100,
+        "max_risk_units": 250,
+        "max_parallel": 8
+      },
+      "rules": [
+        {
+          "id": "deny-critical-irreversible",
+          "effect": "deny",
+          "match": {
+            "risks": ["critical"],
+            "resources": ["irreversible_*"]
+          },
+          "reason": "Critical irreversible resources are not permitted"
+        },
+        {
+          "id": "service-principals-cannot-approve-high-risk",
+          "effect": "deny",
+          "match": {
+            "phases": ["approve"],
+            "risks": ["high", "critical"],
+            "principal_types": ["service"]
+          },
+          "reason": "High-risk approvals require a human principal"
+        }
+      ]
+    },
+    "finance": {
+      "budgets": {
+        "max_risk_units": 80,
+        "max_parallel": 4
+      },
+      "rules": [
+        {
+          "id": "payments-admin-approval",
+          "effect": "deny",
+          "match": {
+            "phases": ["approve"],
+            "domains": ["payments"],
+            "risks": ["critical"],
+            "roles_none": ["admin"]
+          },
+          "reason": "Critical payment changes require an admin approver"
+        },
+        {
+          "id": "block-production-delete-from-service-agent",
+          "effect": "deny",
+          "match": {
+            "actions": ["delete_prod_*"],
+            "principal_types": ["service"]
+          },
+          "reason": "Service principals cannot delete production resources"
+        }
+      ]
+    }
+  }
+}
