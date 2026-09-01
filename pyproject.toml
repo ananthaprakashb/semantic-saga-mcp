@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "semantic-saga-mcp"
 dynamic = ["version"]
-description = "An MCP server for durable saga execution and compensating rollbacks"
+description = "An MCP and A2A server for durable governed saga execution and compensating rollbacks"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
-keywords = ["mcp", "saga", "transactions", "rollback", "agents"]
+keywords = ["mcp", "a2a", "saga", "transactions", "rollback", "agents"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -39,9 +39,13 @@ otel = [
     "opentelemetry-sdk>=1.36,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.36,<2",
 ]
+a2a = [
+    "a2a-sdk[http-server,sqlite,postgresql]>=1.1.2,<2",
+]
 
 [project.scripts]
 semantic-saga-mcp = "semantic_saga_mcp.server:main"
+semantic-saga-a2a = "semantic_saga_mcp.a2a_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
