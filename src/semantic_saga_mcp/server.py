@@ -14,8 +14,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 from . import __version__
 from .actions import FileTransactionTool
 from .coordinator import Coordinator, SagaError
-from .instrumented_coordinator import InstrumentedCoordinator
+from .governance import GovernedCoordinator
 from .observability import configure_telemetry
+from .policy import PolicyError, load_policy_engine
 from .registry import ActionRegistryError, load_action_registry
 from .store import PostgresSagaStore, SagaStore, SQLiteSagaStore
 
@@ -73,6 +74,14 @@ class TimelineArguments(SagaArguments):
     limit: int = Field(default=1000, ge=1, le=5000)
 
 
+class PolicyDecisionsArguments(SagaArguments):
+    limit: int = Field(default=500, ge=1, le=5000)
+
+
+class PolicyStatusArguments(StrictModel):
+    tenant_id: StrictStr | None = None
+
+
 class ListActionsArguments(StrictModel):
     pass
 
@@ -98,6 +107,8 @@ class ToolCallParams(StrictModel):
         "get_saga_timeline",
         "get_audit_events",
         "verify_audit_chain",
+        "get_policy_status",
+        "get_policy_decisions",
         "list_actions",
         "get_action",
     ]
@@ -131,44 +142,42 @@ ARGUMENT_MODELS = {
     "get_saga_timeline": TimelineArguments,
     "get_audit_events": AuditArguments,
     "verify_audit_chain": AuditArguments,
+    "get_policy_status": PolicyStatusArguments,
+    "get_policy_decisions": PolicyDecisionsArguments,
     "list_actions": ListActionsArguments,
     "get_action": GetActionArguments,
 }
 
 TOOLS = [
     {"name": "begin_saga", "description": "Start a durable transactional workflow.", "inputSchema": BeginArguments.model_json_schema()},
-    {"name": "execute_saga_step", "description": "Immediately execute the active immutable action version. This compatibility path still applies action retry/failure policy.", "inputSchema": ExecuteArguments.model_json_schema()},
-    {"name": "plan_saga_step", "description": "Persist a version-pinned workflow node with dependencies and optional approval before any side effect occurs.", "inputSchema": PlanStepArguments.model_json_schema()},
-    {"name": "run_ready_steps", "description": "Execute ready DAG nodes in dependency waves, running independent nodes concurrently under one fenced saga lease.", "inputSchema": RunReadyArguments.model_json_schema()},
-    {"name": "approve_saga_step", "description": "Approve or reject a workflow node that is waiting for human/operator approval.", "inputSchema": ApprovalArguments.model_json_schema()},
-    {"name": "retry_saga_step", "description": "Return a failed/rejected/blocked workflow node to scheduling; uncertain outcomes require explicit force after reconciliation.", "inputSchema": RetryStepArguments.model_json_schema()},
+    {"name": "execute_saga_step", "description": "Immediately execute an action after current governance, schema, and action-policy checks.", "inputSchema": ExecuteArguments.model_json_schema()},
+    {"name": "plan_saga_step", "description": "Persist a version-pinned workflow node; governance may add an approval gate or reject the plan.", "inputSchema": PlanStepArguments.model_json_schema()},
+    {"name": "run_ready_steps", "description": "Re-evaluate current governance and execute ready DAG nodes in bounded dependency waves.", "inputSchema": RunReadyArguments.model_json_schema()},
+    {"name": "approve_saga_step", "description": "Approve or reject a workflow node; approvals are subject to tenant governance while rejection remains fail-safe.", "inputSchema": ApprovalArguments.model_json_schema()},
+    {"name": "retry_saga_step", "description": "Return a failed/rejected/blocked workflow node to scheduling after current governance checks.", "inputSchema": RetryStepArguments.model_json_schema()},
     {"name": "checkpoint_saga", "description": "Persist a named workflow checkpoint and operator/agent-provided checkpoint data.", "inputSchema": CheckpointArguments.model_json_schema()},
-    {"name": "commit_saga", "description": "Commit a successfully completed saga; all planned workflow nodes must be COMPLETED.", "inputSchema": SagaArguments.model_json_schema()},
-    {"name": "rollback_saga", "description": "Compensate saga steps in reverse order using each step's persisted action definition and compensation retry policy.", "inputSchema": SagaArguments.model_json_schema()},
-    {"name": "trigger_rollback", "description": "Immediately compensate saga steps in reverse order after an error.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "commit_saga", "description": "Commit a completed saga after current tenant governance checks.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "rollback_saga", "description": "Compensate saga steps in reverse order; rollback remains available as the safety path.", "inputSchema": SagaArguments.model_json_schema()},
+    {"name": "trigger_rollback", "description": "Immediately start compensation after a client-detected failure.", "inputSchema": SagaArguments.model_json_schema()},
     {"name": "get_saga", "description": "Inspect saga, workflow DAG, checkpoints, action versions, results, approvals, and recovery state.", "inputSchema": SagaArguments.model_json_schema()},
-    {"name": "get_saga_timeline", "description": "Inspect a payload-safe execution timeline combining step summaries, workflow nodes, hash-chained audit events, and audit integrity.", "inputSchema": TimelineArguments.model_json_schema()},
-    {"name": "get_audit_events", "description": "Read append-only audit events for a saga without exposing action inputs, results, or secret material.", "inputSchema": AuditArguments.model_json_schema()},
-    {"name": "verify_audit_chain", "description": "Verify the per-saga SHA-256 audit hash chain and return its current head hash.", "inputSchema": AuditArguments.model_json_schema()},
-    {"name": "list_actions", "description": "List active action contracts, schemas, semantic effects, risk, hashes, and resolved execution policies.", "inputSchema": ListActionsArguments.model_json_schema()},
+    {"name": "get_saga_timeline", "description": "Inspect a payload-safe timeline combining steps, workflow nodes, audit evidence, and integrity status.", "inputSchema": TimelineArguments.model_json_schema()},
+    {"name": "get_audit_events", "description": "Read append-only audit events without exposing action inputs, results, or secret material.", "inputSchema": AuditArguments.model_json_schema()},
+    {"name": "verify_audit_chain", "description": "Verify the per-saga SHA-256 audit hash chain.", "inputSchema": AuditArguments.model_json_schema()},
+    {"name": "get_policy_status", "description": "Inspect the effective governance backend, revision, budgets, approval threshold, and rule ids for the caller tenant.", "inputSchema": PolicyStatusArguments.model_json_schema()},
+    {"name": "get_policy_decisions", "description": "Read durable governance decisions and safety overrides for one tenant-owned saga.", "inputSchema": PolicyDecisionsArguments.model_json_schema()},
+    {"name": "list_actions", "description": "List active action contracts, schemas, semantic effects, risk, hashes, and execution policies.", "inputSchema": ListActionsArguments.model_json_schema()},
     {"name": "get_action", "description": "Inspect one registered action contract by id and optional version.", "inputSchema": GetActionArguments.model_json_schema()},
 ]
 
 SYSTEM_PROMPT = (
-    "Wrap multi-step side effects in the Saga Coordinator. Inspect actions with `list_actions` or `get_action`. "
-    "For orchestrated work, use `plan_saga_step` with dependencies, obtain approvals when required, then call "
-    "`run_ready_steps`. Use checkpoints for durable milestones. If a saga enters RECOVERY_REQUIRED, reconcile the "
-    "external outcome before forcing a retry; otherwise roll back. Use `get_saga_timeline` and `verify_audit_chain` "
-    "when diagnosing or reviewing execution history."
+    "Wrap multi-step side effects in the Saga Coordinator. Inspect actions and governance before execution. "
+    "Use `plan_saga_step` for governed workflows because policy can require approval based on action risk, tenant rules, "
+    "or budgets. Obtain approvals when required, then call `run_ready_steps`; current policy is re-evaluated before side "
+    "effects. Use `get_policy_status` and `get_policy_decisions` for governance evidence, and `get_saga_timeline` plus "
+    "`verify_audit_chain` for operational review. If a saga enters RECOVERY_REQUIRED, reconcile the external outcome "
+    "before forcing a retry; rollback remains available for compensation safety."
 )
-PROMPTS = [
-    {
-        "name": "saga-coordinator",
-        "title": "Saga Coordinator",
-        "description": SYSTEM_PROMPT,
-        "arguments": [],
-    }
-]
+PROMPTS = [{"name": "saga-coordinator", "title": "Saga Coordinator", "description": SYSTEM_PROMPT, "arguments": []}]
 
 
 class McpServer:
@@ -195,16 +204,13 @@ class McpServer:
                 result = {"prompts": PROMPTS}
             elif request.method == "prompts/get":
                 PromptGetParams.model_validate(request.params)
-                result = {
-                    "description": PROMPTS[0]["description"],
-                    "messages": [{"role": "user", "content": {"type": "text", "text": SYSTEM_PROMPT}}],
-                }
+                result = {"description": PROMPTS[0]["description"], "messages": [{"role": "user", "content": {"type": "text", "text": SYSTEM_PROMPT}}]}
             else:
                 return self._error(request.id, -32601, f"Method not found: {request.method}")
             return {"jsonrpc": "2.0", "id": request.id, "result": result}
         except ValidationError as exc:
             return self._error(request_id, -32602, f"Invalid request: {exc}")
-        except (SagaError, ActionRegistryError, KeyError, TypeError, ValueError) as exc:
+        except (SagaError, ActionRegistryError, PolicyError, KeyError, TypeError, ValueError) as exc:
             return self._error(request_id, -32602, str(exc))
         except Exception as exc:
             return self._error(request_id, -32603, f"Internal error: {exc}")
@@ -215,20 +221,13 @@ class McpServer:
         if isinstance(args, BeginArguments):
             value = self.coordinator.begin(args.metadata, session_id=session_id)
         elif isinstance(args, PlanStepArguments):
-            value = self.coordinator.plan_step(
-                args.saga_id, args.action, args.input, session_id=session_id,
-                key=args.key, depends_on=list(args.depends_on), approval_required=args.approval_required,
-            )
+            value = self.coordinator.plan_step(args.saga_id, args.action, args.input, session_id=session_id, key=args.key, depends_on=list(args.depends_on), approval_required=args.approval_required)
         elif isinstance(args, ExecuteArguments):
             value = self.coordinator.execute(args.saga_id, args.action, args.input, session_id=session_id)
         elif isinstance(args, RunReadyArguments):
-            value = self.coordinator.run_ready_steps(
-                args.saga_id, session_id=session_id, max_parallel=args.max_parallel, max_steps=args.max_steps
-            )
+            value = self.coordinator.run_ready_steps(args.saga_id, session_id=session_id, max_parallel=args.max_parallel, max_steps=args.max_steps)
         elif isinstance(args, ApprovalArguments):
-            value = self.coordinator.approve_step(
-                args.saga_id, args.node_id, session_id=session_id, approved=args.approved, reason=args.reason
-            )
+            value = self.coordinator.approve_step(args.saga_id, args.node_id, session_id=session_id, approved=args.approved, reason=args.reason)
         elif isinstance(args, RetryStepArguments):
             value = self.coordinator.retry_step(args.saga_id, args.node_id, session_id=session_id, force=args.force)
         elif isinstance(args, CheckpointArguments):
@@ -237,12 +236,13 @@ class McpServer:
             if params.name == "verify_audit_chain":
                 value = self.coordinator.verify_audit_chain(args.saga_id, session_id=session_id)  # type: ignore[attr-defined]
             else:
-                value = self.coordinator.get_audit_events(  # type: ignore[attr-defined]
-                    args.saga_id, session_id=session_id, limit=args.limit,
-                    event_types=set(args.event_types) if args.event_types else None,
-                )
+                value = self.coordinator.get_audit_events(args.saga_id, session_id=session_id, limit=args.limit, event_types=set(args.event_types) if args.event_types else None)  # type: ignore[attr-defined]
         elif isinstance(args, TimelineArguments):
             value = self.coordinator.get_timeline(args.saga_id, session_id=session_id, limit=args.limit)  # type: ignore[attr-defined]
+        elif isinstance(args, PolicyStatusArguments):
+            value = self.coordinator.get_policy_status(args.tenant_id)  # type: ignore[attr-defined]
+        elif isinstance(args, PolicyDecisionsArguments):
+            value = self.coordinator.get_policy_decisions(args.saga_id, session_id=session_id, limit=args.limit)  # type: ignore[attr-defined]
         elif isinstance(args, ListActionsArguments):
             value = self.coordinator.list_actions()
         elif isinstance(args, GetActionArguments):
@@ -300,64 +300,68 @@ class McpServer:
 
 
 def _env_list(name: str) -> list[str]:
-    value = os.getenv(name, "")
-    return [item.strip() for item in value.split(",") if item.strip()]
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Durable MCP saga coordinator")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--actions", default=os.getenv("SAGA_ACTIONS_FILE"), help="Versioned action registry JSON (legacy action maps remain readable)")
-    parser.add_argument("--allow-legacy-action-recovery", action="store_true", default=os.getenv("SAGA_ALLOW_LEGACY_ACTION_RECOVERY", "").lower() in {"1", "true", "yes"}, help="Explicitly allow pre-0.5 steps without immutable action snapshots to use the currently registered action")
-    parser.add_argument("--file-root", default=os.getenv("SAGA_FILE_ROOT", "./saga-files"), help="Root directory for the built-in create_text_file action")
-    parser.add_argument("--database", default=os.getenv("SAGA_DATABASE"), help="SQLite path for single-node durable storage")
-    parser.add_argument("--postgres-dsn", default=os.getenv("SAGA_POSTGRES_DSN"), help="PostgreSQL DSN for horizontally scaled durable storage")
-    parser.add_argument("--postgres-pool-min", type=int, default=int(os.getenv("SAGA_POSTGRES_POOL_MIN", "1")), help="Minimum PostgreSQL connection-pool size")
-    parser.add_argument("--postgres-pool-max", type=int, default=int(os.getenv("SAGA_POSTGRES_POOL_MAX", "10")), help="Maximum PostgreSQL connection-pool size")
-    parser.add_argument("--worker-id", default=os.getenv("SAGA_WORKER_ID"), help="Unique worker identity; default is generated per process")
-    parser.add_argument("--lease-seconds", type=float, default=float(os.getenv("SAGA_LEASE_SECONDS", "30")), help="Saga mutation/recovery lease duration")
-    parser.add_argument("--recovery-limit", type=int, default=int(os.getenv("SAGA_RECOVERY_LIMIT", "100")), help="Maximum pending sagas claimed during startup recovery")
+    parser.add_argument("--allow-legacy-action-recovery", action="store_true", default=os.getenv("SAGA_ALLOW_LEGACY_ACTION_RECOVERY", "").lower() in {"1", "true", "yes"})
+    parser.add_argument("--file-root", default=os.getenv("SAGA_FILE_ROOT", "./saga-files"))
+    parser.add_argument("--database", default=os.getenv("SAGA_DATABASE"))
+    parser.add_argument("--postgres-dsn", default=os.getenv("SAGA_POSTGRES_DSN"))
+    parser.add_argument("--postgres-pool-min", type=int, default=int(os.getenv("SAGA_POSTGRES_POOL_MIN", "1")))
+    parser.add_argument("--postgres-pool-max", type=int, default=int(os.getenv("SAGA_POSTGRES_POOL_MAX", "10")))
+    parser.add_argument("--worker-id", default=os.getenv("SAGA_WORKER_ID"))
+    parser.add_argument("--lease-seconds", type=float, default=float(os.getenv("SAGA_LEASE_SECONDS", "30")))
+    parser.add_argument("--recovery-limit", type=int, default=int(os.getenv("SAGA_RECOVERY_LIMIT", "100")))
     parser.add_argument("--transport", choices=("stdio", "streamable-http", "sse"), default=os.getenv("SAGA_TRANSPORT", "stdio"))
     parser.add_argument("--host", default=os.getenv("SAGA_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("SAGA_PORT", "8000")))
-    parser.add_argument("--allowed-host", action="append", default=_env_list("SAGA_ALLOWED_HOSTS"), help="Allowed Host value for remote MCP; repeat or set SAGA_ALLOWED_HOSTS as CSV")
-    parser.add_argument("--allowed-origin", action="append", default=_env_list("SAGA_ALLOWED_ORIGINS"), help="Allowed Origin value for browser MCP clients; repeat or set SAGA_ALLOWED_ORIGINS as CSV")
+    parser.add_argument("--allowed-host", action="append", default=_env_list("SAGA_ALLOWED_HOSTS"))
+    parser.add_argument("--allowed-origin", action="append", default=_env_list("SAGA_ALLOWED_ORIGINS"))
 
-    parser.add_argument("--auth-mode", choices=("none", "jwt", "static"), default=os.getenv("SAGA_AUTH_MODE", "none"), help="Native OAuth bearer-token verification mode for Streamable HTTP")
-    parser.add_argument("--auth-issuer", default=os.getenv("SAGA_AUTH_ISSUER"), help="OAuth/OIDC issuer URL advertised in protected-resource metadata")
-    parser.add_argument("--auth-resource-url", default=os.getenv("SAGA_AUTH_RESOURCE_URL"), help="Public MCP resource URL, for example https://mcp.example.com/mcp")
-    parser.add_argument("--auth-audience", default=os.getenv("SAGA_AUTH_AUDIENCE"), help="Expected aud claim for JWT access tokens")
-    parser.add_argument("--auth-jwks-url", default=os.getenv("SAGA_AUTH_JWKS_URL"), help="IdP JWKS endpoint for signed JWT verification")
-    parser.add_argument("--auth-jwt-algorithm", action="append", default=_env_list("SAGA_AUTH_JWT_ALGORITHMS") or ["RS256"], help="Allowed JWT signing algorithm; repeat for multiple")
-    parser.add_argument("--auth-static-tokens", default=os.getenv("SAGA_AUTH_STATIC_TOKENS"), help="Operator-owned JSON token file for development/testing only")
-    parser.add_argument("--auth-required-scope", action="append", default=_env_list("SAGA_AUTH_REQUIRED_SCOPES"), help="OAuth scope required by MCP auth middleware; repeat for multiple")
-    parser.add_argument("--auth-tenant-claim", action="append", default=_env_list("SAGA_AUTH_TENANT_CLAIMS") or ["tenant_id", "tid", "org_id"], help="Token claim used as tenant ID; repeat to define fallbacks")
-    parser.add_argument("--auth-roles-claim", default=os.getenv("SAGA_AUTH_ROLES_CLAIM", "roles"), help="Token claim containing viewer/operator/admin roles")
-    parser.add_argument("--auth-principal-type-claim", default=os.getenv("SAGA_AUTH_PRINCIPAL_TYPE_CLAIM", "principal_type"), help="Token claim identifying user/service principal type")
-    parser.add_argument("--auth-allow-missing-tenant", action="store_true", default=os.getenv("SAGA_AUTH_ALLOW_MISSING_TENANT", "").lower() in {"1", "true", "yes"}, help="Use tenant 'default' when an authenticated token has no configured tenant claim")
+    parser.add_argument("--auth-mode", choices=("none", "jwt", "static"), default=os.getenv("SAGA_AUTH_MODE", "none"))
+    parser.add_argument("--auth-issuer", default=os.getenv("SAGA_AUTH_ISSUER"))
+    parser.add_argument("--auth-resource-url", default=os.getenv("SAGA_AUTH_RESOURCE_URL"))
+    parser.add_argument("--auth-audience", default=os.getenv("SAGA_AUTH_AUDIENCE"))
+    parser.add_argument("--auth-jwks-url", default=os.getenv("SAGA_AUTH_JWKS_URL"))
+    parser.add_argument("--auth-jwt-algorithm", action="append", default=_env_list("SAGA_AUTH_JWT_ALGORITHMS") or ["RS256"])
+    parser.add_argument("--auth-static-tokens", default=os.getenv("SAGA_AUTH_STATIC_TOKENS"))
+    parser.add_argument("--auth-required-scope", action="append", default=_env_list("SAGA_AUTH_REQUIRED_SCOPES"))
+    parser.add_argument("--auth-tenant-claim", action="append", default=_env_list("SAGA_AUTH_TENANT_CLAIMS") or ["tenant_id", "tid", "org_id"])
+    parser.add_argument("--auth-roles-claim", default=os.getenv("SAGA_AUTH_ROLES_CLAIM", "roles"))
+    parser.add_argument("--auth-principal-type-claim", default=os.getenv("SAGA_AUTH_PRINCIPAL_TYPE_CLAIM", "principal_type"))
+    parser.add_argument("--auth-allow-missing-tenant", action="store_true", default=os.getenv("SAGA_AUTH_ALLOW_MISSING_TENANT", "").lower() in {"1", "true", "yes"})
 
-    parser.add_argument("--otel-endpoint", default=os.getenv("SAGA_OTEL_ENDPOINT"), help="OTLP/HTTP collector base endpoint; also honors OTEL_EXPORTER_OTLP_ENDPOINT")
-    parser.add_argument("--otel-headers", default=os.getenv("SAGA_OTEL_HEADERS"), help="Optional OTLP exporter headers string")
-    parser.add_argument("--otel-service-name", default=os.getenv("SAGA_OTEL_SERVICE_NAME", "semantic-saga-mcp"), help="OpenTelemetry service.name")
+    parser.add_argument("--policy-mode", choices=("none", "json", "opa"), default=os.getenv("SAGA_POLICY_MODE", "none"), help="Governance backend: disabled, built-in JSON policy, or external OPA")
+    parser.add_argument("--policy-file", default=os.getenv("SAGA_POLICY_FILE"), help="Tenant governance JSON file for --policy-mode json")
+    parser.add_argument("--policy-opa-url", default=os.getenv("SAGA_POLICY_OPA_URL"), help="OPA base URL for --policy-mode opa")
+    parser.add_argument("--policy-opa-decision-path", default=os.getenv("SAGA_POLICY_OPA_DECISION_PATH", "semantic_saga/decision"))
+    parser.add_argument("--policy-opa-timeout", type=float, default=float(os.getenv("SAGA_POLICY_OPA_TIMEOUT", "2")))
+    parser.add_argument("--policy-opa-token-env", default=os.getenv("SAGA_POLICY_OPA_TOKEN_ENV", "SAGA_OPA_TOKEN"), help="Environment variable holding the optional OPA bearer token")
 
-    parser.add_argument("--trust-identity-headers", action="store_true", default=os.getenv("SAGA_TRUST_IDENTITY_HEADERS", "").lower() in {"1", "true", "yes"}, help="Migration mode: trust identity headers from an authenticated reverse proxy")
-    parser.add_argument("--allow-unauthenticated-http", action="store_true", default=os.getenv("SAGA_ALLOW_UNAUTHENTICATED_HTTP", "").lower() in {"1", "true", "yes"}, help="Allow non-local Streamable HTTP without native/proxy identity; private-network migration only")
-    parser.add_argument("--dry-run", action="store_true", default=os.getenv("SAGA_DRY_RUN", "").lower() in {"1", "true", "yes"}, help="Preview actions, simulate failure, and log compensation without API calls")
+    parser.add_argument("--otel-endpoint", default=os.getenv("SAGA_OTEL_ENDPOINT"))
+    parser.add_argument("--otel-headers", default=os.getenv("SAGA_OTEL_HEADERS"))
+    parser.add_argument("--otel-service-name", default=os.getenv("SAGA_OTEL_SERVICE_NAME", "semantic-saga-mcp"))
+    parser.add_argument("--trust-identity-headers", action="store_true", default=os.getenv("SAGA_TRUST_IDENTITY_HEADERS", "").lower() in {"1", "true", "yes"})
+    parser.add_argument("--allow-unauthenticated-http", action="store_true", default=os.getenv("SAGA_ALLOW_UNAUTHENTICATED_HTTP", "").lower() in {"1", "true", "yes"})
+    parser.add_argument("--dry-run", action="store_true", default=os.getenv("SAGA_DRY_RUN", "").lower() in {"1", "true", "yes"})
     args = parser.parse_args()
 
     if args.database and args.postgres_dsn:
         parser.error("choose --database (SQLite) or --postgres-dsn, not both")
     if args.postgres_pool_min < 1 or args.postgres_pool_max < args.postgres_pool_min:
         parser.error("PostgreSQL pool sizes must satisfy 1 <= min <= max")
-    if args.lease_seconds <= 0:
-        parser.error("--lease-seconds must be positive")
-    if args.recovery_limit < 1:
-        parser.error("--recovery-limit must be positive")
+    if args.lease_seconds <= 0 or args.recovery_limit < 1:
+        parser.error("lease and recovery settings must be positive")
+    if args.policy_opa_timeout <= 0:
+        parser.error("--policy-opa-timeout must be positive")
 
     local_hosts = {"127.0.0.1", "localhost", "::1"}
     remote_streamable_http = args.transport == "streamable-http" and args.host not in local_hosts
     native_auth = args.auth_mode != "none"
-
     if native_auth and args.transport != "streamable-http":
         parser.error("native OAuth authentication is supported only with --transport streamable-http")
     if native_auth and args.trust_identity_headers:
@@ -368,6 +372,10 @@ def main() -> None:
         parser.error("JWT auth requires --auth-audience and --auth-jwks-url")
     if args.auth_mode == "static" and not args.auth_static_tokens:
         parser.error("static auth requires --auth-static-tokens")
+    if args.policy_mode == "json" and not args.policy_file:
+        parser.error("--policy-mode json requires --policy-file")
+    if args.policy_mode == "opa" and not args.policy_opa_url:
+        parser.error("--policy-mode opa requires --policy-opa-url")
 
     if args.transport == "streamable-http":
         if remote_streamable_http and not args.allowed_host:
@@ -375,10 +383,7 @@ def main() -> None:
         if args.allowed_origin and not args.allowed_host:
             parser.error("--allowed-origin requires at least one --allowed-host")
         if remote_streamable_http and not native_auth and not args.trust_identity_headers and not args.allow_unauthenticated_http:
-            parser.error(
-                "non-local Streamable HTTP requires native OAuth or --trust-identity-headers behind an authenticated proxy; "
-                "use --allow-unauthenticated-http only for a controlled private network"
-            )
+            parser.error("non-local Streamable HTTP requires native OAuth or trusted proxy identity; unauthenticated mode is for controlled private networks only")
 
     if args.postgres_dsn:
         store = PostgresSagaStore(args.postgres_dsn, min_pool_size=args.postgres_pool_min, max_pool_size=args.postgres_pool_max)
@@ -388,56 +393,35 @@ def main() -> None:
         store = SagaStore()
 
     try:
-        telemetry = configure_telemetry(
-            service_name=args.otel_service_name,
-            endpoint=args.otel_endpoint,
-            headers=args.otel_headers,
+        telemetry = configure_telemetry(service_name=args.otel_service_name, endpoint=args.otel_endpoint, headers=args.otel_headers)
+        policy_engine = load_policy_engine(
+            args.policy_mode,
+            policy_file=args.policy_file,
+            opa_url=args.policy_opa_url,
+            opa_decision_path=args.policy_opa_decision_path,
+            opa_timeout_seconds=args.policy_opa_timeout,
+            opa_token_env=args.policy_opa_token_env,
         )
-    except RuntimeError as exc:
+    except (RuntimeError, PolicyError) as exc:
         parser.error(str(exc))
 
     logger = lambda message: print(message, file=sys.stderr, flush=True)
-    registry = load_action_registry(
-        args.actions,
-        dry_run=args.dry_run,
-        log=logger,
-        allow_legacy_recovery=args.allow_legacy_action_recovery,
-    )
+    registry = load_action_registry(args.actions, dry_run=args.dry_run, log=logger, allow_legacy_recovery=args.allow_legacy_action_recovery)
     registry.register_runtime(
         "create_text_file",
         FileTransactionTool(Path(args.file_root), logger),
         version="1.0.0",
-        semantic={
-            "domain": "filesystem",
-            "operation": "create",
-            "resource": "text_file",
-            "reversibility": "full",
-            "risk": "low",
-            "effects": {"creates": ["filesystem.text_file"]},
-        },
-        input_schema={
-            "type": "object",
-            "required": ["path", "content"],
-            "properties": {
-                "path": {"type": "string", "minLength": 1},
-                "content": {"type": "string"},
-                "simulate_error": {"type": "boolean"},
-            },
-            "additionalProperties": False,
-        },
-        output_schema={
-            "type": "object",
-            "required": ["path"],
-            "properties": {"path": {"type": "string"}},
-            "additionalProperties": False,
-        },
+        semantic={"domain": "filesystem", "operation": "create", "resource": "text_file", "reversibility": "full", "risk": "low", "effects": {"creates": ["filesystem.text_file"]}},
+        input_schema={"type": "object", "required": ["path", "content"], "properties": {"path": {"type": "string", "minLength": 1}, "content": {"type": "string"}, "simulate_error": {"type": "boolean"}}, "additionalProperties": False},
+        output_schema={"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}, "additionalProperties": False},
     )
-    coordinator = InstrumentedCoordinator(
+    coordinator = GovernedCoordinator(
         store,
         registry,
         worker_id=args.worker_id,
         lease_seconds=args.lease_seconds,
         telemetry=telemetry,
+        policy_engine=policy_engine,
     )
     recovered = coordinator.resume_pending_rollbacks(limit=args.recovery_limit)
     if recovered:
@@ -475,28 +459,15 @@ def main() -> None:
 
     transport_security = None
     if args.allowed_host or args.allowed_origin:
-        transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=args.allowed_host,
-            allowed_origins=args.allowed_origin,
-        )
+        transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=args.allowed_host, allowed_origins=args.allowed_origin)
 
     auth_settings = None
     token_verifier = None
     if native_auth:
         from .auth import JwtTokenVerifier, StaticTokenVerifier
-        auth_settings = AuthSettings(
-            issuer_url=AnyHttpUrl(args.auth_issuer),
-            resource_server_url=AnyHttpUrl(args.auth_resource_url),
-            required_scopes=args.auth_required_scope,
-        )
+        auth_settings = AuthSettings(issuer_url=AnyHttpUrl(args.auth_issuer), resource_server_url=AnyHttpUrl(args.auth_resource_url), required_scopes=args.auth_required_scope)
         if args.auth_mode == "jwt":
-            token_verifier = JwtTokenVerifier(
-                issuer=args.auth_issuer,
-                audience=args.auth_audience,
-                jwks_url=args.auth_jwks_url,
-                algorithms=args.auth_jwt_algorithm,
-            )
+            token_verifier = JwtTokenVerifier(issuer=args.auth_issuer, audience=args.auth_audience, jwks_url=args.auth_jwks_url, algorithms=args.auth_jwt_algorithm)
         else:
             token_verifier = StaticTokenVerifier.from_file(args.auth_static_tokens)
 

@@ -60,14 +60,7 @@ class StaticTokenVerifier(TokenVerifier):
 class JwtTokenVerifier(TokenVerifier):
     """Validate signed OAuth access tokens using an IdP JWKS endpoint."""
 
-    def __init__(
-        self,
-        *,
-        issuer: str,
-        audience: str,
-        jwks_url: str,
-        algorithms: Iterable[str] = ("RS256",),
-    ) -> None:
+    def __init__(self, *, issuer: str, audience: str, jwks_url: str, algorithms: Iterable[str] = ("RS256",)) -> None:
         self.issuer = issuer
         self.audience = audience
         self.algorithms = tuple(algorithms)
@@ -97,7 +90,6 @@ class JwtTokenVerifier(TokenVerifier):
             )
         except jwt.PyJWTError:
             return None
-
         client_id = claims.get("client_id") or claims.get("azp") or claims.get("appid") or claims.get("sub")
         if not isinstance(client_id, str) or not client_id:
             return None
@@ -122,7 +114,7 @@ class JwtTokenVerifier(TokenVerifier):
 
 @dataclass(frozen=True)
 class AuthorizationPolicy:
-    """Small, deterministic RBAC layer independent of any particular IdP."""
+    """Small deterministic RBAC layer; business governance is evaluated separately."""
 
     read_scope: str = "semantic-saga:read"
     execute_scope: str = "semantic-saga:execute"
@@ -134,6 +126,8 @@ class AuthorizationPolicy:
             "get_saga_timeline",
             "get_audit_events",
             "verify_audit_chain",
+            "get_policy_status",
+            "get_policy_decisions",
             "list_actions",
             "get_action",
         }

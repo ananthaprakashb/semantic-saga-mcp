@@ -71,11 +71,7 @@ def inject_current_trace(headers: dict[str, str]) -> None:
 
 
 def mcp_trace_carrier(meta: Mapping[str, Any] | None, headers: Mapping[str, Any] | None = None) -> dict[str, str]:
-    """Build a W3C carrier from MCP `_meta`, falling back to HTTP headers.
-
-    MCP SEP-414 reserves traceparent/tracestate/baggage directly in `_meta`.
-    We intentionally do not copy any other baggage-like application metadata.
-    """
+    """Build a W3C carrier from MCP `_meta`, falling back to HTTP headers."""
     carrier: dict[str, str] = {}
     for key in TRACE_META_KEYS:
         value = (meta or {}).get(key)
@@ -134,39 +130,31 @@ class Telemetry:
         self.tracer = trace.get_tracer(self.service_name)
         self.meter = metrics.get_meter(self.service_name)
         self.saga_counter = self.meter.create_counter(
-            "semantic_saga.saga.operations",
-            unit="{operation}",
-            description="Saga lifecycle operations.",
+            "semantic_saga.saga.operations", unit="{operation}", description="Saga lifecycle operations."
         )
         self.action_attempt_counter = self.meter.create_counter(
-            "semantic_saga.action.attempts",
-            unit="{attempt}",
-            description="Forward action execution attempts.",
+            "semantic_saga.action.attempts", unit="{attempt}", description="Forward action execution attempts."
         )
         self.compensation_attempt_counter = self.meter.create_counter(
-            "semantic_saga.compensation.attempts",
-            unit="{attempt}",
-            description="Compensation attempts.",
+            "semantic_saga.compensation.attempts", unit="{attempt}", description="Compensation attempts."
         )
         self.approval_counter = self.meter.create_counter(
-            "semantic_saga.approval.decisions",
-            unit="{decision}",
-            description="Human or operator approval decisions.",
+            "semantic_saga.approval.decisions", unit="{decision}", description="Human or operator approval decisions."
         )
         self.recovery_counter = self.meter.create_counter(
-            "semantic_saga.recovery.operations",
-            unit="{operation}",
-            description="Recovery claims and operator escalations.",
+            "semantic_saga.recovery.operations", unit="{operation}", description="Recovery claims and operator escalations."
+        )
+        self.policy_counter = self.meter.create_counter(
+            "semantic_saga.policy.decisions", unit="{decision}", description="Governance policy decisions by effect/backend."
         )
         self.action_duration = self.meter.create_histogram(
-            "semantic_saga.action.duration",
-            unit="s",
-            description="Forward action duration including configured retries.",
+            "semantic_saga.action.duration", unit="s", description="Forward action duration including configured retries."
         )
         self.compensation_duration = self.meter.create_histogram(
-            "semantic_saga.compensation.duration",
-            unit="s",
-            description="Compensation duration including configured retries.",
+            "semantic_saga.compensation.duration", unit="s", description="Compensation duration including configured retries."
+        )
+        self.policy_duration = self.meter.create_histogram(
+            "semantic_saga.policy.duration", unit="s", description="Governance policy evaluation duration."
         )
 
     @contextlib.contextmanager
@@ -196,17 +184,9 @@ class Telemetry:
 
 
 def configure_telemetry(
-    *,
-    service_name: str = "semantic-saga-mcp",
-    endpoint: str | None = None,
-    headers: str | None = None,
+    *, service_name: str = "semantic-saga-mcp", endpoint: str | None = None, headers: str | None = None,
 ) -> Telemetry:
-    """Configure OTLP traces/metrics when an endpoint is supplied.
-
-    Without an endpoint, OpenTelemetry API no-op providers are used. Exporters
-    remain an optional install (`semantic-saga-mcp[otel]`) so local users do not
-    pay for the SDK/exporter dependency unless they need it.
-    """
+    """Configure OTLP traces/metrics when an endpoint is supplied."""
     endpoint = endpoint or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
     exporter_headers = _parse_otlp_headers(headers or os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
     if endpoint:
@@ -218,7 +198,7 @@ def configure_telemetry(
             from opentelemetry.sdk.resources import Resource
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        except ImportError as exc:  # pragma: no cover - exercised by CLI validation
+        except ImportError as exc:  # pragma: no cover
             raise RuntimeError(
                 "OTLP export requires the optional observability dependencies; install semantic-saga-mcp[otel]"
             ) from exc
@@ -230,12 +210,10 @@ def configure_telemetry(
             BatchSpanProcessor(OTLPSpanExporter(endpoint=base_endpoint + "/v1/traces", headers=exporter_headers))
         )
         trace.set_tracer_provider(trace_provider)
-
         metric_reader = PeriodicExportingMetricReader(
             OTLPMetricExporter(endpoint=base_endpoint + "/v1/metrics", headers=exporter_headers)
         )
         metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
-
     return Telemetry(service_name=service_name)
 
 
