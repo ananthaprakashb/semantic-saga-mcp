@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   postgres-distributed:
-    name: PostgreSQL leases, fencing, recovery, audit, and governance
+    name: PostgreSQL leases, fencing, recovery, audit, governance, and A2A tasks
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -34,14 +34,14 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install .
+      - run: python -m pip install '.[a2a]'
       - name: Test distributed PostgreSQL guarantees
-        run: python -m unittest tests.test_postgres_store tests.test_postgres_audit tests.test_postgres_governance -v
-      - name: Smoke server startup on PostgreSQL
+        run: python -m unittest tests.test_postgres_store tests.test_postgres_audit tests.test_postgres_governance tests.test_postgres_a2a -v
+      - name: Smoke MCP server startup on PostgreSQL
         shell: bash
         run: |
           set -euo pipefail
-          LOG="$RUNNER_TEMP/postgres-server.log"
+          LOG="$RUNNER_TEMP/postgres-mcp-server.log"
           semantic-saga-mcp \
             --transport streamable-http \
             --host 127.0.0.1 --port 8125 \
@@ -61,4 +61,31 @@ jobs:
                   time.sleep(0.1)
           else:
               raise SystemExit("PostgreSQL-backed MCP server did not become ready")
+          PY
+      - name: Smoke A2A server startup on PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/postgres-a2a-server.log"
+          semantic-saga-a2a \
+            --host 127.0.0.1 --port 8129 \
+            --a2a-public-url http://127.0.0.1:8129 \
+            --postgres-dsn "$SAGA_TEST_POSTGRES_DSN" \
+            --worker-id ci-a2a-worker \
+            --lease-seconds 2 \
+            >"$LOG" 2>&1 &
+          pid=$!
+          trap 'rc=$?; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; if [ "$rc" -ne 0 ]; then cat "$LOG"; fi; exit "$rc"' EXIT
+          python - <<'PY'
+          import json, socket, time, urllib.request
+          for _ in range(80):
+              try:
+                  with socket.create_connection(("127.0.0.1", 8129), timeout=0.2):
+                      break
+              except OSError:
+                  time.sleep(0.1)
+          else:
+              raise SystemExit("PostgreSQL-backed A2A server did not become ready")
+          card = json.load(urllib.request.urlopen("http://127.0.0.1:8129/.well-known/agent-card.json"))
+          assert card["supportedInterfaces"][0]["protocolVersion"] == "1.0", card
           PY
