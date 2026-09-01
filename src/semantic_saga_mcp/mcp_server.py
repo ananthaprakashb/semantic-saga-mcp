@@ -25,6 +25,7 @@ from .auth import AuthorizationError, AuthorizationPolicy, IdentityError
 from .coordinator import Coordinator, SagaError
 from .execution import ExecutionContextResolver
 from .observability import Telemetry, actor_scope, attach_mcp_trace
+from .policy import PolicySubject, policy_subject_scope
 from .server import (
     ARGUMENT_MODELS,
     ApprovalArguments,
@@ -35,6 +36,8 @@ from .server import (
     GetActionArguments,
     ListActionsArguments,
     PlanStepArguments,
+    PolicyDecisionsArguments,
+    PolicyStatusArguments,
     RetryStepArguments,
     RunReadyArguments,
     SYSTEM_PROMPT,
@@ -59,10 +62,7 @@ def _tool_result(value: dict[str, Any]) -> CallToolResult:
 
 
 def _tool_error(message: str) -> CallToolResult:
-    return CallToolResult(
-        content=[TextContent(type="text", text=message)],
-        is_error=True,
-    )
+    return CallToolResult(content=[TextContent(type="text", text=message)], is_error=True)
 
 
 def build_mcp_server(
@@ -73,11 +73,7 @@ def build_mcp_server(
     policy = policy or AuthorizationPolicy()
     telemetry = getattr(coordinator, "telemetry", Telemetry())
     tools = [
-        Tool(
-            name=definition["name"],
-            description=definition["description"],
-            input_schema=definition["inputSchema"],
-        )
+        Tool(name=definition["name"], description=definition["description"], input_schema=definition["inputSchema"])
         for definition in TOOLS
     ]
 
@@ -94,19 +90,23 @@ def build_mcp_server(
         with attach_mcp_trace(meta if isinstance(meta, dict) else None, headers):
             with telemetry.span(
                 "mcp.tools.call",
-                {
-                    "rpc.system": "mcp",
-                    "rpc.method": "tools/call",
-                    "mcp.tool.name": params.name,
-                },
+                {"rpc.system": "mcp", "rpc.method": "tools/call", "mcp.tool.name": params.name},
             ):
                 try:
                     args = model.model_validate(params.arguments or {})
                     execution = resolver.resolve(ctx)
                     policy.authorize(params.name, roles=execution.roles, scopes=execution.scopes)
+                    subject = PolicySubject(
+                        tenant_id=execution.tenant_id,
+                        principal_id=execution.principal_id,
+                        principal_type=execution.principal_type,
+                        roles=execution.roles,
+                        scopes=execution.scopes,
+                        authenticated=execution.authenticated,
+                    )
 
                     def invoke() -> dict[str, Any]:
-                        with actor_scope(execution.principal_id, execution.principal_type):
+                        with actor_scope(execution.principal_id, execution.principal_type), policy_subject_scope(subject):
                             if isinstance(args, BeginArguments):
                                 metadata = dict(args.metadata)
                                 metadata["_identity"] = execution.audit_metadata()
@@ -127,12 +127,7 @@ def build_mcp_server(
                                     approval_required=args.approval_required,
                                 )
                             if isinstance(args, ExecuteArguments):
-                                return coordinator.execute(
-                                    args.saga_id,
-                                    args.action,
-                                    args.input,
-                                    session_id=execution.owner_id,
-                                )
+                                return coordinator.execute(args.saga_id, args.action, args.input, session_id=execution.owner_id)
                             if isinstance(args, RunReadyArguments):
                                 return coordinator.run_ready_steps(
                                     args.saga_id,
@@ -174,10 +169,12 @@ def build_mcp_server(
                                     event_types=set(args.event_types) if args.event_types else None,
                                 )
                             if isinstance(args, TimelineArguments):
-                                return coordinator.get_timeline(
-                                    args.saga_id,
-                                    session_id=execution.owner_id,
-                                    limit=args.limit,
+                                return coordinator.get_timeline(args.saga_id, session_id=execution.owner_id, limit=args.limit)
+                            if isinstance(args, PolicyStatusArguments):
+                                return coordinator.get_policy_status(args.tenant_id)  # type: ignore[attr-defined]
+                            if isinstance(args, PolicyDecisionsArguments):
+                                return coordinator.get_policy_decisions(  # type: ignore[attr-defined]
+                                    args.saga_id, session_id=execution.owner_id, limit=args.limit
                                 )
                             if isinstance(args, ListActionsArguments):
                                 return coordinator.list_actions()
@@ -206,12 +203,7 @@ def build_mcp_server(
             raise ValueError(f"Unknown prompt: {params.name}")
         return GetPromptResult(
             description=SYSTEM_PROMPT,
-            messages=[
-                PromptMessage(
-                    role="user",
-                    content=TextContent(type="text", text=SYSTEM_PROMPT),
-                )
-            ],
+            messages=[PromptMessage(role="user", content=TextContent(type="text", text=SYSTEM_PROMPT))],
         )
 
     return Server(
@@ -227,8 +219,4 @@ def build_mcp_server(
 
 async def run_stdio(server: Server) -> None:
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
+        await server.run(read_stream, write_stream, server.create_initialization_options())
