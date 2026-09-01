@@ -8,7 +8,7 @@ from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf.struct_pb2 import Value
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
 
-from .auth import AuthorizationPolicy
+from .auth import AuthorizationError, AuthorizationPolicy
 from .coordinator import SagaError
 from .observability import actor_scope, attach_mcp_trace
 from .policy import PolicySubject, policy_subject_scope
@@ -266,7 +266,7 @@ class SemanticSagaA2AExecutor:
                 state=TaskState.TASK_STATE_COMPLETED,
                 message=new_text_message(f"Semantic Saga completed the {command.operation} command."),
             )
-        except (ValueError, SagaError) as exc:
+        except (ValueError, SagaError, AuthorizationError) as exc:
             await updater.update_status(
                 state=TaskState.TASK_STATE_REJECTED,
                 message=new_text_message(str(exc)[:1000]),
