@@ -42,6 +42,8 @@ class A2ACommand(BaseModel):
     The A2A ingress intentionally does not execute free-form natural-language
     instructions. Peer agents send one application/json Part.data command so
     orchestration remains deterministic and policy/audit inputs are explicit.
+    Protobuf JSON `number_value` is a double, so integer-valued wire controls are
+    normalized back to ints after rejecting fractional values.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -64,15 +66,21 @@ class A2ACommand(BaseModel):
     force: bool = False
     name: StrictStr | None = None
     data: dict[str, Any] = Field(default_factory=dict)
-    max_parallel: int = Field(default=4, ge=1, le=32)
-    max_steps: int = Field(default=100, ge=1, le=1000)
-    limit: int = Field(default=500, ge=1, le=5000)
+    max_parallel: int | float = Field(default=4, ge=1, le=32)
+    max_steps: int | float = Field(default=100, ge=1, le=1000)
+    limit: int | float = Field(default=500, ge=1, le=5000)
     event_types: list[StrictStr] = Field(default_factory=list)
     version: StrictStr | None = None
     tenant_id: StrictStr | None = None
 
     @model_validator(mode="after")
     def require_operation_fields(self) -> "A2ACommand":
+        for field_name in ("max_parallel", "max_steps", "limit"):
+            value = getattr(self, field_name)
+            if isinstance(value, float):
+                if not value.is_integer():
+                    raise ValueError(f"{field_name} must be an integer")
+                setattr(self, field_name, int(value))
         saga_ops = {
             "execute", "plan", "run", "approve", "retry", "checkpoint", "commit",
             "rollback", "get", "timeline", "audit", "verify_audit", "policy_decisions",
@@ -187,8 +195,8 @@ class SemanticSagaA2AExecutor:
                 return self.coordinator.run_ready_steps(
                     command.saga_id,
                     session_id=owner_id,
-                    max_parallel=command.max_parallel,
-                    max_steps=command.max_steps,
+                    max_parallel=int(command.max_parallel),
+                    max_steps=int(command.max_steps),
                 )
             if command.operation == "approve":
                 return self.coordinator.approve_step(
@@ -218,12 +226,12 @@ class SemanticSagaA2AExecutor:
             if command.operation == "get":
                 return self.coordinator.get(command.saga_id, session_id=owner_id)
             if command.operation == "timeline":
-                return self.coordinator.get_timeline(command.saga_id, session_id=owner_id, limit=command.limit)
+                return self.coordinator.get_timeline(command.saga_id, session_id=owner_id, limit=int(command.limit))
             if command.operation == "audit":
                 return self.coordinator.get_audit_events(
                     command.saga_id,
                     session_id=owner_id,
-                    limit=command.limit,
+                    limit=int(command.limit),
                     event_types=set(command.event_types) if command.event_types else None,
                 )
             if command.operation == "verify_audit":
@@ -236,7 +244,7 @@ class SemanticSagaA2AExecutor:
                 return self.coordinator.get_policy_status(command.tenant_id)
             if command.operation == "policy_decisions":
                 return self.coordinator.get_policy_decisions(
-                    command.saga_id, session_id=owner_id, limit=command.limit
+                    command.saga_id, session_id=owner_id, limit=int(command.limit)
                 )
         raise SagaError(f"Unsupported A2A operation: {command.operation}")
 
