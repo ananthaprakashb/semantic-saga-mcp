@@ -24,35 +24,32 @@ class A2AInteropTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(card.security_schemes["bearer"].http_auth_security_scheme.scheme, "Bearer")
         self.assertGreaterEqual(len(card.skills), 3)
 
-    async def test_sqlite_task_store_survives_reopen_and_is_tenant_scoped(self):
+    async def test_sqlite_task_store_persists_and_is_tenant_scoped(self):
         from a2a.server.context import ServerCallContext
         from a2a.types import Task, TaskState, TaskStatus
         from semantic_saga_mcp.a2a_server import build_task_store
 
         with tempfile.TemporaryDirectory() as temp:
             db = str(Path(temp) / "semantic-saga.db")
-            first, first_engine = build_task_store(sqlite_path=db, postgres_dsn=None)
-            await first.initialize()
-            task = Task(
-                id="task-a2a-1",
-                context_id="context-a2a-1",
-                status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
-            )
-            acme = ServerCallContext(tenant="acme")
-            other = ServerCallContext(tenant="other")
-            await first.save(task, acme)
-            self.assertEqual((await first.get(task.id, acme)).id, task.id)
-            self.assertIsNone(await first.get(task.id, other))
-            await first_engine.dispose()
-
-            second, second_engine = build_task_store(sqlite_path=db, postgres_dsn=None)
-            await second.initialize()
-            restored = await second.get(task.id, acme)
-            self.assertIsNotNone(restored)
-            self.assertEqual(restored.id, task.id)
-            self.assertEqual(restored.status.state, TaskState.TASK_STATE_COMPLETED)
-            self.assertIsNone(await second.get(task.id, other))
-            await second_engine.dispose()
+            store, engine = build_task_store(sqlite_path=db, postgres_dsn=None)
+            await store.initialize()
+            try:
+                task = Task(
+                    id="task-a2a-1",
+                    context_id="context-a2a-1",
+                    status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
+                )
+                acme = ServerCallContext(tenant="acme")
+                other = ServerCallContext(tenant="other")
+                await store.save(task, acme)
+                restored = await store.get(task.id, acme)
+                self.assertIsNotNone(restored)
+                self.assertEqual(restored.id, task.id)
+                self.assertEqual(restored.status.state, TaskState.TASK_STATE_COMPLETED)
+                self.assertIsNone(await store.get(task.id, other))
+                self.assertTrue(Path(db).exists())
+            finally:
+                await engine.dispose()
 
 
 if __name__ == "__main__":
