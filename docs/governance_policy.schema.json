@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-saga.dev/schemas/governance-policy-v1.json",
+  "title": "Semantic Saga Governance Policy",
+  "type": "object",
+  "required": ["schema_version", "tenants"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "revision": {"type": "string", "minLength": 1},
+    "default_effect": {"enum": ["allow", "deny", "require_approval"]},
+    "risk_weights": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "tenants": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/tenantPolicy"}
+    }
+  },
+  "$defs": {
+    "stringOrArray": {
+      "oneOf": [
+        {"type": "string"},
+        {"type": "array", "items": {"type": "string"}}
+      ]
+    },
+    "match": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "actions": {"$ref": "#/$defs/stringOrArray"},
+        "phases": {"$ref": "#/$defs/stringOrArray"},
+        "risks": {"$ref": "#/$defs/stringOrArray"},
+        "domains": {"$ref": "#/$defs/stringOrArray"},
+        "operations": {"$ref": "#/$defs/stringOrArray"},
+        "resources": {"$ref": "#/$defs/stringOrArray"},
+        "principal_types": {"$ref": "#/$defs/stringOrArray"},
+        "roles_any": {"$ref": "#/$defs/stringOrArray"},
+        "roles_all": {"$ref": "#/$defs/stringOrArray"},
+        "roles_none": {"$ref": "#/$defs/stringOrArray"},
+        "scopes_any": {"$ref": "#/$defs/stringOrArray"}
+      }
+    },
+    "rule": {
+      "type": "object",
+      "required": ["id", "effect"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "effect": {"enum": ["allow", "deny", "require_approval"]},
+        "reason": {"type": "string"},
+        "match": {"$ref": "#/$defs/match"}
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_steps_per_saga": {"type": "integer", "minimum": 1},
+        "max_planned_nodes": {"type": "integer", "minimum": 1},
+        "max_risk_units": {"type": "integer", "minimum": 1},
+        "max_parallel": {"type": "integer", "minimum": 1}
+      }
+    },
+    "tenantPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default_effect": {"enum": ["allow", "deny", "require_approval"]},
+        "approval_at_or_above_risk": {"enum": ["unknown", "low", "medium", "high", "critical"]},
+        "budgets": {"$ref": "#/$defs/budgets"},
+        "rules": {"type": "array", "items": {"$ref": "#/$defs/rule"}}
+      }
+    }
+  }
+}
