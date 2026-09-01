@@ -4,8 +4,6 @@ import hashlib
 from typing import Any, Literal, Mapping
 
 import anyio
-from google.protobuf.json_format import MessageToDict, ParseDict
-from google.protobuf.struct_pb2 import Value
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
 
 from .auth import AuthorizationError, AuthorizationPolicy
@@ -104,6 +102,8 @@ def _identity(context: Any) -> dict[str, Any]:
 
 
 def _data_command(message: Any) -> dict[str, Any]:
+    from google.protobuf.json_format import MessageToDict
+
     if message is None:
         raise SagaError("A2A request requires a message")
     values: list[Any] = []
@@ -117,6 +117,8 @@ def _data_command(message: Any) -> dict[str, Any]:
 
 def _result_part(value: dict[str, Any]) -> Any:
     from a2a.types import Part
+    from google.protobuf.json_format import ParseDict
+    from google.protobuf.struct_pb2 import Value
 
     return Part(data=ParseDict(value, Value()), media_type="application/json")
 
