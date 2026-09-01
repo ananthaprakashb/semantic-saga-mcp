@@ -15,10 +15,10 @@ class PostgresA2ATests(unittest.IsolatedAsyncioTestCase):
         from a2a.types import Task, TaskState, TaskStatus
         from semantic_saga_mcp.a2a_server import build_task_store
 
-        task_id = "pg-a2a-" + uuid.uuid4().hex
+        task_id = str(uuid.uuid4())
         task = Task(
             id=task_id,
-            context_id="ctx-" + uuid.uuid4().hex,
+            context_id=str(uuid.uuid4()),
             status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
         )
         acme = ServerCallContext(tenant="acme")
