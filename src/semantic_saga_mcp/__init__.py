@@ -1,3 +1,3 @@
-"""Durable saga coordinator exposed through the Model Context Protocol."""
+"""Durable governed saga coordinator exposed through MCP and A2A."""
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
