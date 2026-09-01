@@ -1,0 +1,231 @@
+name: A2A CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  a2a-interoperability:
+    name: A2A 1.0 discovery, auth, tasks, governance, and restart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install '.[a2a]'
+      - name: Test Agent Card and SQL task-store primitives
+        run: python -m unittest tests.test_a2a_interop -v
+      - name: Verify governed A2A 1.0 peer interoperability
+        shell: bash
+        run: |
+          set -euo pipefail
+          DB="$RUNNER_TEMP/semantic-saga-a2a.db"
+          TOKENS="$RUNNER_TEMP/a2a-tokens.json"
+          POLICY="$RUNNER_TEMP/a2a-policy.json"
+          FILE_ROOT="$RUNNER_TEMP/a2a-files"
+          LOG="$RUNNER_TEMP/semantic-saga-a2a.log"
+          STATE="$RUNNER_TEMP/a2a-state.json"
+
+          cat >"$TOKENS" <<'JSON'
+          {
+            "operator-token": {"client_id":"agent-a","subject":"agent-a","scopes":["semantic-saga"],"claims":{"tenant_id":"acme","roles":["operator"],"principal_type":"service"}},
+            "peer-token": {"client_id":"agent-b","subject":"agent-b","scopes":["semantic-saga"],"claims":{"tenant_id":"acme","roles":["operator"],"principal_type":"service"}},
+            "viewer-token": {"client_id":"agent-viewer","subject":"agent-viewer","scopes":["semantic-saga"],"claims":{"tenant_id":"acme","roles":["viewer"],"principal_type":"service"}},
+            "outsider-token": {"client_id":"agent-other","subject":"agent-other","scopes":["semantic-saga"],"claims":{"tenant_id":"other","roles":["operator"],"principal_type":"service"}}
+          }
+          JSON
+
+          cat >"$POLICY" <<'JSON'
+          {
+            "schema_version": 1,
+            "revision": "ci-a2a-policy-8",
+            "default_effect": "deny",
+            "tenants": {
+              "*": {
+                "default_effect": "allow",
+                "approval_at_or_above_risk": "low",
+                "budgets": {"max_steps_per_saga":10,"max_planned_nodes":10,"max_risk_units":20,"max_parallel":1}
+              }
+            }
+          }
+          JSON
+
+          pid=""
+          start_server() {
+            : >"$LOG"
+            semantic-saga-a2a \
+              --host 127.0.0.1 --port 8128 \
+              --a2a-public-url http://127.0.0.1:8128 \
+              --a2a-rpc-path /a2a \
+              --database "$DB" \
+              --file-root "$FILE_ROOT" \
+              --auth-mode static --auth-static-tokens "$TOKENS" \
+              --policy-mode json --policy-file "$POLICY" \
+              >"$LOG" 2>&1 &
+            pid=$!
+            python - <<'PY'
+          import socket, time
+          for _ in range(80):
+              try:
+                  with socket.create_connection(("127.0.0.1", 8128), timeout=0.2):
+                      break
+              except OSError:
+                  time.sleep(0.1)
+          else:
+              raise SystemExit("A2A server did not become ready")
+          PY
+          }
+          stop_server() {
+            if [ -n "${pid:-}" ]; then
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+              pid=""
+            fi
+          }
+          trap 'rc=$?; stop_server; if [ "$rc" -ne 0 ]; then cat "$LOG"; fi; exit "$rc"' EXIT
+
+          start_server
+
+          python - <<'PY'
+          import json, urllib.request
+          card = json.load(urllib.request.urlopen("http://127.0.0.1:8128/.well-known/agent-card.json"))
+          assert card["supportedInterfaces"][0]["protocolBinding"] == "JSONRPC", card
+          assert card["supportedInterfaces"][0]["protocolVersion"] == "1.0", card
+          assert card["supportedInterfaces"][0]["url"] == "http://127.0.0.1:8128/a2a", card
+          assert card.get("capabilities", {}).get("streaming", False) is False, card
+          assert "bearer" in card.get("securitySchemes", {}), card
+          PY
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8128/a2a -H 'content-type: application/json' -d '{}')" = "401"
+
+          STATE="$STATE" python - <<'PY'
+          import asyncio, json, os
+          from pathlib import Path
+          from uuid import uuid4
+
+          import httpx
+          from a2a.client import ClientConfig, create_client
+          from a2a.types import GetTaskRequest, Message, Part, Role, SendMessageRequest, TaskState
+          from google.protobuf.json_format import MessageToDict, ParseDict
+          from google.protobuf.struct_pb2 import Value
+
+          BASE = "http://127.0.0.1:8128"
+
+          async def client_for(token):
+              http = httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=30.0)
+              client = await create_client(BASE, client_config=ClientConfig(streaming=False, polling=False, httpx_client=http))
+              return client
+
+          async def send(client, command):
+              message = Message(
+                  role=Role.ROLE_USER,
+                  message_id=uuid4().hex,
+                  parts=[Part(data=ParseDict(command, Value()), media_type="application/json")],
+              )
+              task_id = None
+              async for event in client.send_message(request=SendMessageRequest(message=message)):
+                  if event.HasField("task"):
+                      task_id = event.task.id
+                  elif event.HasField("status_update"):
+                      task_id = event.status_update.task_id
+                  elif event.HasField("artifact_update"):
+                      task_id = event.artifact_update.task_id
+                  elif event.HasField("message") and event.message.task_id:
+                      task_id = event.message.task_id
+              assert task_id, "A2A send_message did not return a task id"
+              return await client.get_task(request=GetTaskRequest(id=task_id))
+
+          def result(task):
+              for artifact in task.artifacts:
+                  for part in artifact.parts:
+                      if part.WhichOneof("content") == "data":
+                          return MessageToDict(part.data)
+              return None
+
+          def status_text(task):
+              if task.status.HasField("message"):
+                  return "\n".join(part.text for part in task.status.message.parts if part.WhichOneof("content") == "text")
+              return ""
+
+          async def main():
+              operator = await client_for("operator-token")
+              begin = await send(operator, {"operation":"begin","metadata":{"case":"phase8"}})
+              assert begin.status.state == TaskState.TASK_STATE_COMPLETED, begin
+              begin_result = result(begin)
+              saga_id = begin_result["id"]
+              assert begin_result["tenant_id"] == "acme"
+              assert begin_result["metadata"]["_interop"]["protocol"] == "a2a"
+
+              planned = await send(operator, {"operation":"plan","saga_id":saga_id,"action":"create_text_file","input":{"path":"a2a-ci.txt","content":"phase8"}})
+              assert planned.status.state == TaskState.TASK_STATE_COMPLETED, planned
+              node = result(planned)
+              assert node["status"] == "WAITING_APPROVAL", node
+
+              approved = await send(operator, {"operation":"approve","saga_id":saga_id,"node_id":node["id"],"approved":True,"reason":"A2A CI"})
+              assert approved.status.state == TaskState.TASK_STATE_COMPLETED, approved
+
+              over_budget = await send(operator, {"operation":"run","saga_id":saga_id,"max_parallel":2})
+              assert over_budget.status.state == TaskState.TASK_STATE_REJECTED, over_budget
+              assert "parallelism budget" in status_text(over_budget), status_text(over_budget)
+
+              ran = await send(operator, {"operation":"run","saga_id":saga_id,"max_parallel":1})
+              assert ran.status.state == TaskState.TASK_STATE_COMPLETED, ran
+              assert result(ran)["workflow"]["nodes"][0]["status"] == "COMPLETED", result(ran)
+              await operator.close()
+
+              peer = await client_for("peer-token")
+              fetched = await send(peer, {"operation":"get","saga_id":saga_id})
+              assert fetched.status.state == TaskState.TASK_STATE_COMPLETED, fetched
+              assert result(fetched)["id"] == saga_id
+              decisions = await send(peer, {"operation":"policy_decisions","saga_id":saga_id})
+              assert decisions.status.state == TaskState.TASK_STATE_COMPLETED, decisions
+              assert any(e["data"].get("revision") == "ci-a2a-policy-8" for e in result(decisions)["events"] if e["event_type"] == "POLICY_DECISION")
+              await peer.close()
+
+              viewer = await client_for("viewer-token")
+              visible = await send(viewer, {"operation":"get","saga_id":saga_id})
+              assert visible.status.state == TaskState.TASK_STATE_COMPLETED, visible
+              denied = await send(viewer, {"operation":"commit","saga_id":saga_id})
+              assert denied.status.state == TaskState.TASK_STATE_REJECTED, denied
+              assert "not authorized" in status_text(denied), status_text(denied)
+              await viewer.close()
+
+              outsider = await client_for("outsider-token")
+              hidden = await send(outsider, {"operation":"get","saga_id":saga_id})
+              assert hidden.status.state == TaskState.TASK_STATE_REJECTED, hidden
+              assert "Saga not found" in status_text(hidden), status_text(hidden)
+              await outsider.close()
+
+              Path(os.environ["STATE"]).write_text(json.dumps({"saga_id":saga_id,"task_id":begin.id}), encoding="utf-8")
+
+          asyncio.run(main())
+          PY
+
+          stop_server
+          start_server
+
+          STATE="$STATE" python - <<'PY'
+          import asyncio, json, os
+          from pathlib import Path
+          import httpx
+          from a2a.client import ClientConfig, create_client
+          from a2a.types import GetTaskRequest, TaskState
+
+          BASE = "http://127.0.0.1:8128"
+          state = json.loads(Path(os.environ["STATE"]).read_text(encoding="utf-8"))
+
+          async def main():
+              http = httpx.AsyncClient(headers={"Authorization":"Bearer peer-token"}, timeout=30.0)
+              client = await create_client(BASE, client_config=ClientConfig(streaming=False, polling=False, httpx_client=http))
+              task = await client.get_task(request=GetTaskRequest(id=state["task_id"]))
+              assert task.id == state["task_id"]
+              assert task.status.state == TaskState.TASK_STATE_COMPLETED
+              await client.close()
+
+          asyncio.run(main())
+          PY
