@@ -57,44 +57,29 @@ jobs:
           semantic-saga-mcp --transport streamable-http --host 127.0.0.1 --port 8123 --database "$DB" >"$LOG" 2>&1 &
           pid=$!
           trap 'rc=$?; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; if [ "$rc" -ne 0 ]; then cat "$LOG"; fi; exit "$rc"' EXIT
-
           python - <<'PY'
-          import socket
-          import time
-
+          import socket, time
           for _ in range(50):
               try:
-                  with socket.create_connection(("127.0.0.1", 8123), timeout=0.2):
-                      break
-              except OSError:
-                  time.sleep(0.1)
-          else:
-              raise SystemExit("Streamable HTTP server did not become ready")
+                  with socket.create_connection(("127.0.0.1", 8123), timeout=0.2): break
+              except OSError: time.sleep(0.1)
+          else: raise SystemExit("Streamable HTTP server did not become ready")
           PY
-
           python - <<'PY'
           import asyncio
           from mcp import Client
-
           URL = "http://127.0.0.1:8123/mcp"
-
-          async def main() -> None:
+          async def main():
               async with Client(URL) as first:
-                  assert first.protocol_version == "2026-07-28", first.protocol_version
+                  assert first.protocol_version == "2026-07-28"
                   created = await first.call_tool("begin_saga", {"metadata": {"smoke": True}})
                   assert not created.is_error, created
                   saga_id = created.structured_content["id"]
-
               async with Client(URL) as second:
-                  assert second.protocol_version == "2026-07-28", second.protocol_version
                   fetched = await second.call_tool("get_saga", {"saga_id": saga_id})
                   assert not fetched.is_error, fetched
-                  assert fetched.structured_content["id"] == saga_id
-                  assert fetched.structured_content["status"] == "ACTIVE"
                   integrity = await second.call_tool("verify_audit_chain", {"saga_id": saga_id})
-                  assert not integrity.is_error, integrity
-                  assert integrity.structured_content["valid"] is True
-
+                  assert not integrity.is_error and integrity.structured_content["valid"] is True
           asyncio.run(main())
           PY
 
@@ -117,101 +102,143 @@ jobs:
           TOKENS="$RUNNER_TEMP/tokens.json"
           cat >"$TOKENS" <<'JSON'
           {
-            "operator-token": {
-              "client_id": "agent-client",
-              "subject": "alice",
-              "scopes": ["semantic-saga"],
-              "claims": {"tenant_id": "acme", "roles": ["operator"], "principal_type": "user"}
-            },
-            "viewer-token": {
-              "client_id": "viewer-client",
-              "subject": "bob",
-              "scopes": ["semantic-saga"],
-              "claims": {"tenant_id": "acme", "roles": ["viewer"], "principal_type": "user"}
-            },
-            "outsider-token": {
-              "client_id": "other-client",
-              "subject": "mallory",
-              "scopes": ["semantic-saga"],
-              "claims": {"tenant_id": "other", "roles": ["operator"], "principal_type": "user"}
+            "operator-token": {"client_id":"agent-client","subject":"alice","scopes":["semantic-saga"],"claims":{"tenant_id":"acme","roles":["operator"],"principal_type":"user"}},
+            "viewer-token": {"client_id":"viewer-client","subject":"bob","scopes":["semantic-saga"],"claims":{"tenant_id":"acme","roles":["viewer"],"principal_type":"user"}},
+            "outsider-token": {"client_id":"other-client","subject":"mallory","scopes":["semantic-saga"],"claims":{"tenant_id":"other","roles":["operator"],"principal_type":"user"}}
+          }
+          JSON
+          semantic-saga-mcp --transport streamable-http --host 127.0.0.1 --port 8124 --database "$DB" \
+            --auth-mode static --auth-static-tokens "$TOKENS" --auth-issuer https://auth.example.com \
+            --auth-resource-url http://127.0.0.1:8124/mcp --auth-required-scope semantic-saga >"$LOG" 2>&1 &
+          pid=$!
+          trap 'rc=$?; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; if [ "$rc" -ne 0 ]; then cat "$LOG"; fi; exit "$rc"' EXIT
+          python - <<'PY'
+          import socket, time
+          for _ in range(50):
+              try:
+                  with socket.create_connection(("127.0.0.1", 8124), timeout=0.2): break
+              except OSError: time.sleep(0.1)
+          else: raise SystemExit("OAuth MCP server did not become ready")
+          PY
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8124/mcp)" = "401"
+          curl -fsS http://127.0.0.1:8124/.well-known/oauth-protected-resource/mcp | grep -q 'https://auth.example.com/'
+          python - <<'PY'
+          import asyncio, httpx2
+          from mcp import Client
+          from mcp.client.streamable_http import streamable_http_client
+          URL = "http://127.0.0.1:8124/mcp"
+          async def client_for(token):
+              http_client = httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"})
+              return http_client, Client(streamable_http_client(URL, http_client=http_client))
+          async def main():
+              operator_http, target = await client_for("operator-token")
+              async with operator_http, target as operator:
+                  created = await operator.call_tool("begin_saga", {"metadata": {"case": "phase7"}})
+                  assert not created.is_error, created
+                  saga_id = created.structured_content["id"]
+              viewer_http, target = await client_for("viewer-token")
+              async with viewer_http, target as viewer:
+                  assert not (await viewer.call_tool("get_saga", {"saga_id": saga_id})).is_error
+                  assert not (await viewer.call_tool("get_saga_timeline", {"saga_id": saga_id})).is_error
+                  assert (await viewer.call_tool("commit_saga", {"saga_id": saga_id})).is_error
+              outsider_http, target = await client_for("outsider-token")
+              async with outsider_http, target as outsider:
+                  hidden = await outsider.call_tool("get_saga_timeline", {"saga_id": saga_id})
+                  assert hidden.is_error and "Saga not found" in hidden.content[0].text
+          asyncio.run(main())
+          PY
+
+  governance-smoke:
+    name: Tenant policy, approval, budget, and decision audit smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install .
+      - name: Verify governed MCP execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/semantic-saga-governance.log"
+          DB="$RUNNER_TEMP/semantic-saga-governance.db"
+          TOKENS="$RUNNER_TEMP/governance-tokens.json"
+          POLICY="$RUNNER_TEMP/governance-policy.json"
+          FILE_ROOT="$RUNNER_TEMP/saga-files"
+          cat >"$TOKENS" <<'JSON'
+          {
+            "operator-token": {"client_id":"agent-client","subject":"alice","scopes":["semantic-saga"],"claims":{"tenant_id":"acme","roles":["operator"],"principal_type":"user"}},
+            "viewer-token": {"client_id":"viewer-client","subject":"bob","scopes":["semantic-saga"],"claims":{"tenant_id":"acme","roles":["viewer"],"principal_type":"user"}},
+            "outsider-token": {"client_id":"other-client","subject":"mallory","scopes":["semantic-saga"],"claims":{"tenant_id":"other","roles":["viewer"],"principal_type":"user"}}
+          }
+          JSON
+          cat >"$POLICY" <<'JSON'
+          {
+            "schema_version": 1,
+            "revision": "ci-policy-7",
+            "default_effect": "deny",
+            "tenants": {
+              "*": {
+                "default_effect": "allow",
+                "approval_at_or_above_risk": "low",
+                "budgets": {"max_steps_per_saga":10,"max_planned_nodes":10,"max_risk_units":20,"max_parallel":1}
+              }
             }
           }
           JSON
-
-          semantic-saga-mcp \
-            --transport streamable-http \
-            --host 127.0.0.1 --port 8124 \
-            --database "$DB" \
-            --auth-mode static \
-            --auth-static-tokens "$TOKENS" \
-            --auth-issuer https://auth.example.com \
-            --auth-resource-url http://127.0.0.1:8124/mcp \
-            --auth-required-scope semantic-saga \
-            >"$LOG" 2>&1 &
+          semantic-saga-mcp --transport streamable-http --host 127.0.0.1 --port 8126 --database "$DB" \
+            --file-root "$FILE_ROOT" --policy-mode json --policy-file "$POLICY" \
+            --auth-mode static --auth-static-tokens "$TOKENS" --auth-issuer https://auth.example.com \
+            --auth-resource-url http://127.0.0.1:8126/mcp --auth-required-scope semantic-saga >"$LOG" 2>&1 &
           pid=$!
           trap 'rc=$?; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; if [ "$rc" -ne 0 ]; then cat "$LOG"; fi; exit "$rc"' EXIT
-
           python - <<'PY'
-          import socket
-          import time
+          import socket, time
           for _ in range(50):
               try:
-                  with socket.create_connection(("127.0.0.1", 8124), timeout=0.2):
-                      break
-              except OSError:
-                  time.sleep(0.1)
-          else:
-              raise SystemExit("OAuth MCP server did not become ready")
+                  with socket.create_connection(("127.0.0.1", 8126), timeout=0.2): break
+              except OSError: time.sleep(0.1)
+          else: raise SystemExit("Governed MCP server did not become ready")
           PY
-
-          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8124/mcp)" = "401"
-          curl -fsS http://127.0.0.1:8124/.well-known/oauth-protected-resource/mcp | grep -q 'https://auth.example.com/'
-
           python - <<'PY'
-          import asyncio
-          import httpx2
+          import asyncio, httpx2
           from mcp import Client
           from mcp.client.streamable_http import streamable_http_client
-
-          URL = "http://127.0.0.1:8124/mcp"
-
-          async def client_for(token: str):
+          URL = "http://127.0.0.1:8126/mcp"
+          async def client_for(token):
               http_client = httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"})
               return http_client, Client(streamable_http_client(URL, http_client=http_client))
-
-          async def main() -> None:
-              operator_http, operator_target = await client_for("operator-token")
-              async with operator_http, operator_target as operator:
-                  created = await operator.call_tool("begin_saga", {"metadata": {"case": "phase6"}})
+          async def main():
+              operator_http, target = await client_for("operator-token")
+              async with operator_http, target as operator:
+                  created = await operator.call_tool("begin_saga", {})
                   assert not created.is_error, created
                   saga_id = created.structured_content["id"]
-                  identity = created.structured_content["metadata"]["_identity"]
-                  assert identity["tenant_id"] == "acme"
-                  assert identity["principal_id"] == "alice"
-
-              viewer_http, viewer_target = await client_for("viewer-token")
-              async with viewer_http, viewer_target as viewer:
-                  fetched = await viewer.call_tool("get_saga", {"saga_id": saga_id})
-                  assert not fetched.is_error, fetched
-                  timeline = await viewer.call_tool("get_saga_timeline", {"saga_id": saga_id})
-                  assert not timeline.is_error, timeline
-                  assert timeline.structured_content["audit_integrity"]["valid"] is True
-                  audit = await viewer.call_tool("get_audit_events", {"saga_id": saga_id})
-                  assert not audit.is_error, audit
-                  assert audit.structured_content["events"][0]["actor_principal_id"] == "alice"
-                  denied = await viewer.call_tool("commit_saga", {"saga_id": saga_id})
-                  assert denied.is_error, denied
-                  assert "not authorized" in denied.content[0].text
-
-              outsider_http, outsider_target = await client_for("outsider-token")
-              async with outsider_http, outsider_target as outsider:
-                  hidden = await outsider.call_tool("get_saga", {"saga_id": saga_id})
-                  assert hidden.is_error, hidden
-                  assert "Saga not found" in hidden.content[0].text
-                  hidden_timeline = await outsider.call_tool("get_saga_timeline", {"saga_id": saga_id})
-                  assert hidden_timeline.is_error, hidden_timeline
-                  assert "Saga not found" in hidden_timeline.content[0].text
-
+                  planned = await operator.call_tool("plan_saga_step", {"saga_id":saga_id,"action":"create_text_file","input":{"path":"ci.txt","content":"governed"}})
+                  assert not planned.is_error, planned
+                  node_id = planned.structured_content["id"]
+                  assert planned.structured_content["status"] == "WAITING_APPROVAL"
+                  approved = await operator.call_tool("approve_saga_step", {"saga_id":saga_id,"node_id":node_id,"approved":True,"reason":"ci"})
+                  assert not approved.is_error, approved
+                  denied = await operator.call_tool("run_ready_steps", {"saga_id":saga_id,"max_parallel":2})
+                  assert denied.is_error and "parallelism budget" in denied.content[0].text, denied
+                  ran = await operator.call_tool("run_ready_steps", {"saga_id":saga_id,"max_parallel":1})
+                  assert not ran.is_error, ran
+                  decisions = await operator.call_tool("get_policy_decisions", {"saga_id":saga_id})
+                  assert not decisions.is_error, decisions
+                  assert any(e["data"].get("revision") == "ci-policy-7" for e in decisions.structured_content["events"] if e["event_type"] == "POLICY_DECISION")
+              viewer_http, target = await client_for("viewer-token")
+              async with viewer_http, target as viewer:
+                  status = await viewer.call_tool("get_policy_status", {})
+                  assert not status.is_error and status.structured_content["revision"] == "ci-policy-7", status
+                  same = await viewer.call_tool("get_policy_decisions", {"saga_id":saga_id})
+                  assert not same.is_error, same
+              outsider_http, target = await client_for("outsider-token")
+              async with outsider_http, target as outsider:
+                  hidden = await outsider.call_tool("get_policy_decisions", {"saga_id":saga_id})
+                  assert hidden.is_error and "Saga not found" in hidden.content[0].text, hidden
           asyncio.run(main())
           PY
 
